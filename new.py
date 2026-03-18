@@ -4,7 +4,7 @@ Upload + View Telegram Bot (single-file)
 
 Changes made:
 - Token generation: tokens are only persisted (activated) when the user actually opens the deep link (i.e. /start token_xxx).
-- Active tokens grant unlimited access for 12 hours.
+- Active tokens grant unlimited access for 24 hours.
 - VIP users bypass tokens.
 - /protection admin command toggles sending with protect_content True/False (persisted in DB).
 - Keeps content/media DB schema intact. Only token activation flow & settings modified.
@@ -57,6 +57,10 @@ def home():
 def run():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", "8080")))
 
+t = Thread(target=run)
+t.daemon = True
+t.start()
+
 # ---------- CONFIG (ENV-friendly) ----------
 UPLOAD_BOT_TOKEN = os.environ.get("UPLOAD_BOT_TOKEN", "8413595718:AAEI8yJAcDt22VbzASEpNR_aJNMXrMscdGk")
 MAIN_CHANNEL_ID = os.environ.get("MAIN_CHANNEL_ID", "-1003104322226")
@@ -64,19 +68,22 @@ PASSWORD = os.environ.get("UPLOAD_PASSWORD", "test")
 PASSWORD_VALID_SECONDS = int(os.environ.get("PASSWORD_VALID_SECONDS", 24 * 3600))
 DB_PATH = os.environ.get("DB_PATH", "tg_content.db")
 ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "6233731222").split(",") if x.strip().isdigit()]
+OWNER_ID = ADMIN_IDS[0] if ADMIN_IDS else None
 
 EXEIO_API_KEY = os.environ.get("EXEIO_API_KEY", "c204899d0187dc988e3d368d21038fbf82789531").strip()
 EXEIO_API_ENDPOINT = os.environ.get("EXEIO_API_ENDPOINT", "https://exe.io/api")
+EXEIO_TIMEOUT_SECONDS = float(os.environ.get("EXEIO_TIMEOUT_SECONDS", "3.5"))
 
 # default runtime flag; actual value loaded from DB settings at startup
 content_protection = True
 
 # token validity
-TOKEN_VALID_SECONDS = 12 * 3600  # 12 hours
+TOKEN_VALID_SECONDS = 24 * 3600  # 24 hours
 
 # Conversation states
 (
     STATE_PASSWORD,
+    STATE_THUMBNAIL_PICK,
     STATE_THUMBNAIL,
     STATE_DESCRIPTION,
     STATE_OPTION,
@@ -84,22 +91,32 @@ TOKEN_VALID_SECONDS = 12 * 3600  # 12 hours
     STATE_TEXT_UPLOAD,
     STATE_TOKEN_REQUIRE,
     STATE_CONFIRM_TOKEN,
-) = range(8)
+) = range(9)
 
 sessions: Dict[int, Dict[str, Any]] = {}
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ----------------- DB helpers -----------------
 def init_db() -> None:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    # Better write/read behavior under shared hosting load.
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
     c.execute("""CREATE TABLE IF NOT EXISTS users(
         user_id INTEGER PRIMARY KEY,
         last_auth INTEGER,
-        is_vip INTEGER DEFAULT 0
+        is_vip INTEGER DEFAULT 0,
+        vip_name TEXT
     )""")
+    c.execute("PRAGMA table_info(users)")
+    user_columns = {row[1] for row in c.fetchall()}
+    if "vip_name" not in user_columns:
+        c.execute("ALTER TABLE users ADD COLUMN vip_name TEXT")
     # Run this once in your bot startup section (after DB connect)
 # with sqlite3.connect("your_database_name.db") as conn:
 #     c = conn.cursor()
@@ -146,6 +163,19 @@ def init_db() -> None:
         key TEXT PRIMARY KEY,
         value TEXT
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS saved_thumbnails(
+        thumb_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_id INTEGER,
+        thumb_file_id TEXT NOT NULL,
+        name TEXT NOT NULL UNIQUE,
+        created_at INTEGER
+    )""")
+    # Query speed-ups for common lookups.
+    c.execute("CREATE INDEX IF NOT EXISTS idx_users_is_vip ON users(is_vip)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_tokens_user_expires ON tokens(user_id, expires_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_tokens_expires ON tokens(expires_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_media_items_content_id ON media_items(content_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_shortener_requests_token ON shortener_requests(token)")
     conn.commit()
     conn.close()
 
@@ -237,24 +267,121 @@ def set_user_auth(user_id: int):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     now = int(time.time())
-    # preserve VIP flag if present
-    c.execute("SELECT is_vip FROM users WHERE user_id = ?", (user_id,))
+    # preserve VIP fields if present
+    c.execute("SELECT is_vip, vip_name FROM users WHERE user_id = ?", (user_id,))
     row = c.fetchone()
     is_vip = row[0] if row else 0
-    c.execute("INSERT OR REPLACE INTO users(user_id,last_auth,is_vip) VALUES(?,?,?)", (user_id, now, is_vip))
+    vip_name = row[1] if row else None
+    c.execute(
+        "INSERT OR REPLACE INTO users(user_id,last_auth,is_vip,vip_name) VALUES(?,?,?,?)",
+        (user_id, now, is_vip, vip_name),
+    )
     conn.commit()
     conn.close()
 
-def set_user_vip(user_id: int, is_vip: int = 1):
+def set_user_vip(user_id: int, is_vip: int = 1, vip_name: Optional[str] = None):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # preserve last_auth if present
-    c.execute("SELECT last_auth FROM users WHERE user_id = ?", (user_id,))
+    # preserve last_auth and name if present
+    c.execute("SELECT last_auth, vip_name FROM users WHERE user_id = ?", (user_id,))
     row = c.fetchone()
     last_auth = row[0] if row else 0
-    c.execute("INSERT OR REPLACE INTO users(user_id,last_auth,is_vip) VALUES(?,?,?)", (user_id, last_auth, is_vip))
+    existing_name = row[1] if row else None
+    if is_vip:
+        resolved_name = (vip_name or existing_name or "").strip() or None
+    else:
+        resolved_name = None
+    c.execute(
+        "INSERT OR REPLACE INTO users(user_id,last_auth,is_vip,vip_name) VALUES(?,?,?,?)",
+        (user_id, last_auth, is_vip, resolved_name),
+    )
     conn.commit()
     conn.close()
+
+def list_vips(include_owner: bool = True) -> List[Dict[str, Any]]:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if include_owner or OWNER_ID is None:
+        c.execute(
+            "SELECT user_id, COALESCE(vip_name, '') FROM users WHERE is_vip = 1 ORDER BY user_id ASC"
+        )
+    else:
+        c.execute(
+            "SELECT user_id, COALESCE(vip_name, '') FROM users WHERE is_vip = 1 AND user_id != ? ORDER BY user_id ASC",
+            (OWNER_ID,),
+        )
+    rows = c.fetchall()
+    conn.close()
+    return [{"user_id": row[0], "vip_name": (row[1] or "").strip()} for row in rows]
+
+def remove_all_vips_except_owner() -> int:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if OWNER_ID is None:
+        c.execute("SELECT COUNT(1) FROM users WHERE is_vip = 1")
+        removed_count = c.fetchone()[0]
+        c.execute("UPDATE users SET is_vip = 0, vip_name = NULL WHERE is_vip = 1")
+    else:
+        c.execute("SELECT COUNT(1) FROM users WHERE is_vip = 1 AND user_id != ?", (OWNER_ID,))
+        removed_count = c.fetchone()[0]
+        c.execute(
+            "UPDATE users SET is_vip = 0, vip_name = NULL WHERE is_vip = 1 AND user_id != ?",
+            (OWNER_ID,),
+        )
+    conn.commit()
+    conn.close()
+    return removed_count
+
+def save_named_thumbnail(owner_id: int, thumb_file_id: str, name: str) -> Dict[str, Any]:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    clean_name = name.strip()
+    now = int(time.time())
+    c.execute("SELECT thumb_id FROM saved_thumbnails WHERE name = ?", (clean_name,))
+    row = c.fetchone()
+    if row:
+        thumb_id = row[0]
+        c.execute(
+            "UPDATE saved_thumbnails SET owner_id = ?, thumb_file_id = ?, created_at = ? WHERE thumb_id = ?",
+            (owner_id, thumb_file_id, now, thumb_id),
+        )
+        created = False
+    else:
+        c.execute(
+            "INSERT INTO saved_thumbnails(owner_id, thumb_file_id, name, created_at) VALUES(?,?,?,?)",
+            (owner_id, thumb_file_id, clean_name, now),
+        )
+        thumb_id = c.lastrowid
+        created = True
+    conn.commit()
+    conn.close()
+    return {"thumb_id": thumb_id, "created": created}
+
+def list_saved_thumbnails() -> List[Dict[str, Any]]:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT thumb_id, owner_id, thumb_file_id, name FROM saved_thumbnails ORDER BY name COLLATE NOCASE ASC"
+    )
+    rows = c.fetchall()
+    conn.close()
+    return [
+        {"thumb_id": row[0], "owner_id": row[1], "thumb_file_id": row[2], "name": row[3]}
+        for row in rows
+    ]
+
+def get_saved_thumbnail(thumb_id: int) -> Optional[Dict[str, Any]]:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT thumb_id, owner_id, thumb_file_id, name FROM saved_thumbnails WHERE thumb_id = ?",
+        (thumb_id,),
+    )
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"thumb_id": row[0], "owner_id": row[1], "thumb_file_id": row[2], "name": row[3]}
 
 def save_content_to_db(uploader_id: int, thumb_file_id: str, description: str, is_text_only: int, requires_token: int) -> int:
     conn = sqlite3.connect(DB_PATH)
@@ -413,6 +540,13 @@ def kb_watch_button_with_emoji(watch_link: str):
 def kb_get_token_button_with_emoji(content_id: int):
     return InlineKeyboardMarkup([[InlineKeyboardButton("🎟️ Get Token", callback_data=f"gettok_{content_id}")]])
 
+def kb_thumbnail_choices_with_emoji(saved_thumbnails: List[Dict[str, Any]]):
+    keyboard = [[InlineKeyboardButton("🖼️ Upload new thumbnail", callback_data="thumb_upload_new")]]
+    for thumb in saved_thumbnails:
+        keyboard.append([InlineKeyboardButton(f"📌 {thumb['name']}", callback_data=f"thumb_use_{thumb['thumb_id']}")])
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="thumb_cancel")])
+    return InlineKeyboardMarkup(keyboard)
+
 # ---------- exe.io shortener (async) ----------
 async def exeio_shorten_long_url(long_url: str) -> Optional[str]:
     """
@@ -427,7 +561,7 @@ async def exeio_shorten_long_url(long_url: str) -> Optional[str]:
         encoded = urllib.parse.quote(long_url, safe='')
         api = f"{EXEIO_API_ENDPOINT}?api={EXEIO_API_KEY}&url={encoded}"
         async with aiohttp.ClientSession() as sess:
-            async with sess.get(api, timeout=10) as resp:
+            async with sess.get(api, timeout=EXEIO_TIMEOUT_SECONDS) as resp:
                 try:
                     data = await resp.json()
                 except Exception:
@@ -501,13 +635,13 @@ async def handle_view_content(update: Update, context: ContextTypes.DEFAULT_TYPE
     # otherwise ask to get token
     kb = kb_get_token_button_with_emoji(content_id)
     await update.effective_chat.send_message(
-        "🔒 This content requires a token to watch. Tokens are valid for 12 hours. Tap below to get your token.", reply_markup=kb
+        "🔒 This content requires a token to watch. Tokens are valid for 24 hours. Tap below to get your token.", reply_markup=kb
     )
 
 async def handle_token_start(update: Update, context: ContextTypes.DEFAULT_TYPE, token: str):
     """
     This is invoked when user opens the deep link t.me/<bot>?start=token_<token>
-    At this moment we ACTIVIATE (persist) the token for this user for 12 hours.
+    At this moment we ACTIVIATE (persist) the token for this user for 24 hours.
     """
     user = update.effective_user
     user_id = user.id
@@ -541,7 +675,7 @@ async def handle_token_start(update: Update, context: ContextTypes.DEFAULT_TYPE,
         mins = (remain % 3600) // 60
         await update.effective_chat.send_message(f"🎉 Token activated — you can watch protected content for the next {hrs}h {mins}m.")
     else:
-        await update.effective_chat.send_message("🎉 Token activated. You can now access protected content for the next 12 hours.")
+        await update.effective_chat.send_message("🎉 Token activated. You can now access protected content for the next 24 hours.")
 
 async def send_content_media(update: Update, context: ContextTypes.DEFAULT_TYPE, content: Dict[str, Any]):
     chat = update.effective_chat
@@ -591,6 +725,56 @@ async def send_content_media(update: Update, context: ContextTypes.DEFAULT_TYPE,
         logger.exception("Failed to send media: %s", e)
         await chat.send_message("Failed to send media. The file ids may be invalid or the bot lacks access.")
 
+async def ask_thumbnail_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    saved_thumbnails = list_saved_thumbnails()
+    if saved_thumbnails:
+        text = "Choose thumbnail source:\n1) Upload new image\n2) Tap a saved thumbnail name"
+    else:
+        text = "Choose thumbnail source. No saved thumbnails yet, so use 'Upload new thumbnail'."
+    await update.message.reply_text(
+        text,
+        reply_markup=kb_thumbnail_choices_with_emoji(saved_thumbnails),
+    )
+    return STATE_THUMBNAIL_PICK
+
+async def thumbnail_choice_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    session = sessions.get(user_id)
+    if not session:
+        await query.edit_message_text("No active upload session. Send /upload to start.")
+        return ConversationHandler.END
+
+    data = query.data
+    if data == "thumb_cancel":
+        sessions.pop(user_id, None)
+        await query.edit_message_text("Upload canceled and session reset.")
+        return ConversationHandler.END
+
+    if data == "thumb_upload_new":
+        await query.edit_message_text("Send the thumbnail image (photo).")
+        return STATE_THUMBNAIL
+
+    if data.startswith("thumb_use_"):
+        try:
+            thumb_id = int(data.split("_", 2)[2])
+        except Exception:
+            await query.edit_message_text("Invalid thumbnail selected. Send /upload and try again.")
+            return ConversationHandler.END
+        thumb = get_saved_thumbnail(thumb_id)
+        if not thumb:
+            await query.edit_message_text("Saved thumbnail not found. Send /upload and try again.")
+            return ConversationHandler.END
+        session["thumb_file_id"] = thumb["thumb_file_id"]
+        await query.edit_message_text(
+            f"Using saved thumbnail: {thumb['name']}\nNow send the description text message."
+        )
+        return STATE_DESCRIPTION
+
+    await query.edit_message_text("Unknown thumbnail option.")
+    return ConversationHandler.END
+
 # --- Upload flow (mostly preserved) ---
 async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -604,13 +788,13 @@ async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_vip:
         sessions[user_id] = {"uploader_id": user_id, "media_list": []}
-        await update.message.reply_text("🌟 VIP detected — you can upload now. Send the thumbnail image (photo).")
-        return STATE_THUMBNAIL
+        await update.message.reply_text("🌟 VIP detected — you can upload now.")
+        return await ask_thumbnail_source(update, context)
 
     if user_is_authed(user_id):
         sessions[user_id] = {"uploader_id": user_id, "media_list": []}
-        await update.message.reply_text("🔓 Password validated. Please send the thumbnail image now (photo).")
-        return STATE_THUMBNAIL
+        await update.message.reply_text("🔓 Password validated.")
+        return await ask_thumbnail_source(update, context)
     else:
         await update.message.reply_text("Please enter the password to begin upload:")
         return STATE_PASSWORD
@@ -621,8 +805,8 @@ async def password_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text.strip() == PASSWORD:
         set_user_auth(user_id)
         sessions[user_id] = {"uploader_id": user_id, "media_list": []}
-        await update.message.reply_text("✅ Password accepted for 24 hours. Now send the thumbnail image (photo).")
-        return STATE_THUMBNAIL
+        await update.message.reply_text("✅ Password accepted for 24 hours.")
+        return await ask_thumbnail_source(update, context)
     else:
         await update.message.reply_text("❌ Wrong password. Send /upload to try again.")
         return ConversationHandler.END
@@ -849,7 +1033,7 @@ async def callback_get_token_exeio(update: Update, context: ContextTypes.DEFAULT
         record_shortener_request(short_link, token, status="created")
         await query.edit_message_text(
             "🎟️ *Token prepared!*\n\n"
-            "Click the link below to open Telegram and activate your token. The token is activated only when you open the link — not when it is generated. Token valid for 12 hours after activation.",
+            "Click the link below to open Telegram and activate your token. The token is activated only when you open the link — not when it is generated. Token valid for 24 hours after activation.",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🔗 Open to Activate Token", url=short_link)]]
             ),
@@ -867,37 +1051,218 @@ async def callback_get_token_exeio(update: Update, context: ContextTypes.DEFAULT
         )
 
 # Admin / VIP commands
+async def cmd_addthum(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if OWNER_ID is None:
+        await update.message.reply_text("Owner is not configured.")
+        return
+    if user.id != OWNER_ID:
+        await update.message.reply_text("Only owner can use /addthum.")
+        return
+
+    context.user_data["awaiting_addthum_photo"] = True
+    context.user_data.pop("awaiting_addthum_name", None)
+    context.user_data.pop("pending_addthum_file_id", None)
+    await update.message.reply_text("Send the thumbnail image now. Send 'cancel' anytime to stop.")
+
 async def cmd_addvip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user.id not in ADMIN_IDS:
         await update.message.reply_text("Only admins can manage VIPs.")
         return
     if not context.args:
-        await update.message.reply_text("Usage: /addvip <user_id>")
+        await update.message.reply_text("Usage: /addvip <user_id> [name]")
         return
     try:
         uid = int(context.args[0])
     except ValueError:
         await update.message.reply_text("Invalid user id")
         return
-    set_user_vip(uid, 1)
-    await update.message.reply_text(f"User {uid} marked as VIP.")
+    if len(context.args) == 1:
+        context.user_data["awaiting_addvip_name_for"] = uid
+        await update.message.reply_text(
+            f"Send VIP name for user {uid}. Send 'cancel' to stop."
+        )
+        return
+    vip_name = " ".join(context.args[1:]).strip()
+    if not vip_name:
+        await update.message.reply_text("VIP name cannot be empty.")
+        return
+    set_user_vip(uid, 1, vip_name)
+    await update.message.reply_text(f"User {uid} marked as VIP with name: {vip_name}")
 
 async def cmd_delvip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user.id not in ADMIN_IDS:
         await update.message.reply_text("Only admins can manage VIPs.")
         return
-    if not context.args:
-        await update.message.reply_text("Usage: /delvip <user_id>")
+    if context.args:
+        try:
+            uid = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("Invalid user id")
+            return
+        if OWNER_ID is not None and uid == OWNER_ID:
+            await update.message.reply_text("Owner VIP cannot be removed.")
+            return
+        set_user_vip(uid, 0)
+        await update.message.reply_text(f"User {uid} removed from VIPs.")
         return
+
+    vip_rows = list_vips(include_owner=True)
+    if not vip_rows:
+        await update.message.reply_text("No VIP users found.")
+        return
+
+    message_lines = ["VIP users list:"]
+    for row in vip_rows:
+        uid = row["user_id"]
+        name = row["vip_name"] or "No name"
+        if OWNER_ID is not None and uid == OWNER_ID:
+            message_lines.append(f"- {name} | {uid} (owner, protected)")
+        else:
+            message_lines.append(f"- {name} | {uid}")
+    message_lines.append("")
+    message_lines.append("Send the user ID to remove from VIP.")
+    message_lines.append("Send 'cancel' to stop.")
+
+    context.user_data["awaiting_delvip_id"] = True
+    await update.message.reply_text("\n".join(message_lines))
+
+async def cmd_clearvips(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("Only admins can manage VIPs.")
+        return
+    removed_count = remove_all_vips_except_owner()
+    if OWNER_ID is None:
+        await update.message.reply_text(f"Removed VIP status from {removed_count} users.")
+    else:
+        await update.message.reply_text(
+            f"Removed VIP status from {removed_count} users. Owner ({OWNER_ID}) was kept."
+        )
+
+async def addthum_photo_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_addthum_photo"):
+        return
+
+    user = update.effective_user
+    if OWNER_ID is None or user.id != OWNER_ID:
+        context.user_data.pop("awaiting_addthum_photo", None)
+        context.user_data.pop("pending_addthum_file_id", None)
+        return
+
+    if not update.message.photo:
+        await update.message.reply_text("Please send a photo, or send 'cancel'.")
+        return
+
+    context.user_data["pending_addthum_file_id"] = update.message.photo[-1].file_id
+    context.user_data.pop("awaiting_addthum_photo", None)
+    context.user_data["awaiting_addthum_name"] = True
+    await update.message.reply_text("Image saved. Now send a name for this thumbnail. Send 'cancel' to stop.")
+
+async def delvip_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("awaiting_addthum_photo"):
+        text = (update.message.text or "").strip()
+        if text.lower() == "cancel":
+            context.user_data.pop("awaiting_addthum_photo", None)
+            context.user_data.pop("pending_addthum_file_id", None)
+            await update.message.reply_text("Add thumbnail cancelled.")
+        else:
+            await update.message.reply_text("Please send a photo for /addthum, or send 'cancel'.")
+        return
+
+    if context.user_data.get("awaiting_addthum_name"):
+        user = update.effective_user
+        if OWNER_ID is None or user.id != OWNER_ID:
+            context.user_data.pop("awaiting_addthum_name", None)
+            context.user_data.pop("pending_addthum_file_id", None)
+            return
+
+        text = (update.message.text or "").strip()
+        if text.lower() == "cancel":
+            context.user_data.pop("awaiting_addthum_name", None)
+            context.user_data.pop("pending_addthum_file_id", None)
+            await update.message.reply_text("Add thumbnail cancelled.")
+            return
+
+        if not text:
+            await update.message.reply_text("Thumbnail name cannot be empty. Send a name, or 'cancel'.")
+            return
+
+        pending_file_id = context.user_data.get("pending_addthum_file_id")
+        if not pending_file_id:
+            context.user_data.pop("awaiting_addthum_name", None)
+            await update.message.reply_text("Thumbnail image is missing. Run /addthum again.")
+            return
+
+        result = save_named_thumbnail(user.id, pending_file_id, text)
+        context.user_data.pop("awaiting_addthum_name", None)
+        context.user_data.pop("pending_addthum_file_id", None)
+        if result["created"]:
+            await update.message.reply_text(f"Saved thumbnail '{text}' successfully.")
+        else:
+            await update.message.reply_text(f"Updated thumbnail '{text}' successfully.")
+        return
+
+    pending_addvip_uid = context.user_data.get("awaiting_addvip_name_for")
+    if pending_addvip_uid is not None:
+        user = update.effective_user
+        if user.id not in ADMIN_IDS:
+            context.user_data.pop("awaiting_addvip_name_for", None)
+            return
+
+        text = (update.message.text or "").strip()
+        if text.lower() == "cancel":
+            context.user_data.pop("awaiting_addvip_name_for", None)
+            await update.message.reply_text("Add VIP cancelled.")
+            return
+
+        if not text:
+            await update.message.reply_text("VIP name cannot be empty. Send a name, or 'cancel'.")
+            return
+
+        set_user_vip(int(pending_addvip_uid), 1, text)
+        context.user_data.pop("awaiting_addvip_name_for", None)
+        await update.message.reply_text(f"User {pending_addvip_uid} marked as VIP with name: {text}")
+        return
+
+    if not context.user_data.get("awaiting_delvip_id"):
+        return
+
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        context.user_data.pop("awaiting_delvip_id", None)
+        return
+
+    text = (update.message.text or "").strip()
+    if text.lower() == "cancel":
+        context.user_data.pop("awaiting_delvip_id", None)
+        await update.message.reply_text("VIP removal cancelled.")
+        return
+
     try:
-        uid = int(context.args[0])
+        uid = int(text)
     except ValueError:
-        await update.message.reply_text("Invalid user id")
+        await update.message.reply_text("Please send a valid numeric user ID, or send 'cancel'.")
         return
+
+    if OWNER_ID is not None and uid == OWNER_ID:
+        await update.message.reply_text("Owner VIP cannot be removed. Send another ID, or 'cancel'.")
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT is_vip, COALESCE(vip_name, '') FROM users WHERE user_id = ?", (uid,))
+    row = c.fetchone()
+    conn.close()
+    if not row or not row[0]:
+        await update.message.reply_text("That user is not a VIP. Send another ID, or 'cancel'.")
+        return
+
     set_user_vip(uid, 0)
-    await update.message.reply_text(f"User {uid} removed from VIPs.")
+    context.user_data.pop("awaiting_delvip_id", None)
+    await update.message.reply_text(f"Removed VIP: {row[1] or 'No name'} ({uid})")
 
 # New /changepass admin command
 async def cmd_changepass(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -990,16 +1355,14 @@ async def cmd_myinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"⏳ Password valid for another {hrs}h {mins}m {secs}s.")
 
 # Utility to register handlers and run
-def main():
-    init_db()
-    load_password_from_db()
-    load_protection_from_db()
-    app = ApplicationBuilder().token(UPLOAD_BOT_TOKEN).build()
+def build_telegram_application():
+    tg_app = ApplicationBuilder().token(UPLOAD_BOT_TOKEN).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("upload", cmd_upload)],
         states={
             STATE_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, password_text)],
+            STATE_THUMBNAIL_PICK: [CallbackQueryHandler(thumbnail_choice_pressed, pattern="^thumb_"), CommandHandler("cancel", cancel_command)],
             STATE_THUMBNAIL: [MessageHandler(filters.PHOTO & ~filters.COMMAND, thumbnail_handler), CommandHandler("cancel", cancel_command)],
             STATE_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, description_handler), CommandHandler("cancel", cancel_command)],
             STATE_OPTION: [CallbackQueryHandler(option_pressed)],
@@ -1015,29 +1378,34 @@ def main():
         allow_reentry=True,
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv)
+    tg_app.add_handler(CommandHandler("start", start))
+    tg_app.add_handler(conv)
     # Original option handlers
-    app.add_handler(CallbackQueryHandler(option_pressed, pattern="^opt_"))
-    app.add_handler(CallbackQueryHandler(token_choice_callback, pattern="^tok_"))
+    tg_app.add_handler(CallbackQueryHandler(option_pressed, pattern="^opt_"))
+    tg_app.add_handler(CallbackQueryHandler(token_choice_callback, pattern="^tok_"))
     # Use improved token handler (creates token link, but activation only on /start)
-    app.add_handler(CallbackQueryHandler(callback_get_token_exeio, pattern="^gettok_"))
+    tg_app.add_handler(CallbackQueryHandler(callback_get_token_exeio, pattern="^gettok_"))
 
     # admin & misc commands
-    app.add_handler(CommandHandler("addvip", cmd_addvip))
-    app.add_handler(CommandHandler("delvip", cmd_delvip))
-    app.add_handler(CommandHandler("changepass", cmd_changepass))
-    app.add_handler(CommandHandler("myinfo", cmd_myinfo))
-    app.add_handler(CommandHandler("protection", cmd_protection))
+    tg_app.add_handler(CommandHandler("addthum", cmd_addthum))
+    tg_app.add_handler(CommandHandler("addvip", cmd_addvip))
+    tg_app.add_handler(CommandHandler("delvip", cmd_delvip))
+    tg_app.add_handler(CommandHandler("clearvips", cmd_clearvips))
+    tg_app.add_handler(CommandHandler("delallvip", cmd_clearvips))
+    tg_app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, addthum_photo_input_handler))
+    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, delvip_input_handler))
+    tg_app.add_handler(CommandHandler("changepass", cmd_changepass))
+    tg_app.add_handler(CommandHandler("myinfo", cmd_myinfo))
+    tg_app.add_handler(CommandHandler("protection", cmd_protection))
+    return tg_app
 
+def main():
+    init_db()
+    load_password_from_db()
+    load_protection_from_db()
+    tg_app = build_telegram_application()
     logger.info("Upload+View Bot starting...")
-    app.run_polling()
+    tg_app.run_polling()
 
 if __name__ == "__main__":
-    # Only run Flask's built-in server for local/direct execution.
-    # Under Gunicorn, this file is imported, so starting app.run() there
-    # would cause "Address already in use" on the same PORT.
-    t = Thread(target=run)
-    t.daemon = True
-    t.start()
     main()
