@@ -164,6 +164,36 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ----------------- DB helpers -----------------
+def _is_db_dir_writable(path: str) -> bool:
+    abs_path = os.path.abspath(path)
+    dir_path = os.path.dirname(abs_path) or "."
+    try:
+        os.makedirs(dir_path, exist_ok=True)
+    except Exception:
+        return False
+    probe = os.path.join(dir_path, f".db_write_probe_{os.getpid()}_{int(time.time())}")
+    try:
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(probe)
+        return True
+    except Exception:
+        return False
+
+def _ensure_writable_db_path() -> None:
+    global DB_PATH
+    if _is_db_dir_writable(DB_PATH):
+        return
+    base_name = os.path.basename(DB_PATH) or "tg_content.db"
+    fallback_dir = os.environ.get("DB_FALLBACK_DIR", "/tmp").strip() or "/tmp"
+    fallback_path = os.path.join(fallback_dir, base_name)
+    if not _is_db_dir_writable(fallback_path):
+        raise RuntimeError(
+            f"DB path is not writable: {DB_PATH}. Fallback is also not writable: {fallback_path}"
+        )
+    logger.warning("DB path %s is read-only. Using writable fallback DB path: %s", DB_PATH, fallback_path)
+    DB_PATH = fallback_path
+
 def _apply_db_schema(conn: sqlite3.Connection) -> None:
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS users(
@@ -250,6 +280,8 @@ def _quarantine_corrupt_db_files() -> None:
             logger.exception("Failed to move corrupt SQLite file: %s", src)
 
 def init_db() -> None:
+    global DB_PATH
+    _ensure_writable_db_path()
     conn = None
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -261,6 +293,25 @@ def init_db() -> None:
         conn.commit()
         conn.close()
         return
+    except sqlite3.OperationalError as e:
+        if conn:
+            conn.close()
+        if "readonly" not in str(e).lower():
+            raise
+        old_path = DB_PATH
+        base_name = os.path.basename(DB_PATH) or "tg_content.db"
+        fallback_dir = os.environ.get("DB_FALLBACK_DIR", "/tmp").strip() or "/tmp"
+        fallback_path = os.path.join(fallback_dir, base_name)
+        if old_path != fallback_path:
+            logger.warning(
+                "SQLite DB path appears read-only (%s). Retrying with fallback path: %s",
+                old_path,
+                fallback_path,
+            )
+            DB_PATH = fallback_path
+            _ensure_writable_db_path()
+            return init_db()
+        raise
     except sqlite3.DatabaseError as e:
         if conn:
             conn.close()
