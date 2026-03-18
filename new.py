@@ -25,6 +25,7 @@ import secrets
 import sqlite3
 import urllib
 import asyncio
+import shutil
 from typing import Dict, Any, List, Optional
 
 import aiohttp
@@ -118,7 +119,8 @@ UPLOAD_BOT_TOKEN = os.environ.get("UPLOAD_BOT_TOKEN", "8413595718:AAEI8yJAcDt22V
 MAIN_CHANNEL_ID = os.environ.get("MAIN_CHANNEL_ID", "-1003104322226")
 PASSWORD = os.environ.get("UPLOAD_PASSWORD", "test")
 PASSWORD_VALID_SECONDS = int(os.environ.get("PASSWORD_VALID_SECONDS", 24 * 3600))
-DB_PATH = os.environ.get("DB_PATH", "tg_content.db")
+DB_PATH = os.environ.get("DB_PATH", "tgBotdb.db")
+DB_BACKUP_PATH = os.environ.get("DB_BACKUP_PATH", "tgBotdb.db").strip()
 ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "6233731222").split(",") if x.strip().isdigit()]
 OWNER_ID = ADMIN_IDS[0] if ADMIN_IDS else None
 
@@ -164,6 +166,80 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ----------------- DB helpers -----------------
+def _resolve_existing_db_path() -> None:
+    """
+    If DB_PATH points to a non-existent file but '<DB_PATH>.db' exists,
+    use the existing .db file instead of creating a new empty DB.
+    """
+    global DB_PATH
+
+    def _content_rows(path: str) -> int:
+        try:
+            if not os.path.exists(path):
+                return -1
+            with sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True) as conn:
+                c = conn.cursor()
+                c.execute("SELECT COUNT(1) FROM content")
+                row = c.fetchone()
+                return int(row[0] if row and row[0] is not None else 0)
+        except Exception:
+            return -1
+
+    # If backup DB exists and current DB is missing, use backup immediately.
+    if DB_BACKUP_PATH and os.path.exists(DB_BACKUP_PATH) and not os.path.exists(DB_PATH):
+        logger.warning("DB_PATH '%s' not found; using backup DB '%s'.", DB_PATH, DB_BACKUP_PATH)
+        DB_PATH = DB_BACKUP_PATH
+        return
+
+    # If both exist but current DB has no content while backup has content, prefer backup.
+    if DB_BACKUP_PATH and os.path.exists(DB_BACKUP_PATH) and os.path.exists(DB_PATH):
+        current_rows = _content_rows(DB_PATH)
+        backup_rows = _content_rows(DB_BACKUP_PATH)
+        if (
+            os.path.abspath(DB_PATH) != os.path.abspath(DB_BACKUP_PATH)
+            and current_rows == 0
+            and backup_rows > 0
+        ):
+            logger.warning(
+                "Current DB '%s' has no content rows; switching to backup DB '%s' (%s rows).",
+                DB_PATH,
+                DB_BACKUP_PATH,
+                backup_rows,
+            )
+            DB_PATH = DB_BACKUP_PATH
+            return
+
+    if os.path.exists(DB_PATH):
+        return
+    alt = f"{DB_PATH}.db"
+    if os.path.exists(alt):
+        logger.warning("DB_PATH '%s' not found; using existing DB file '%s'.", DB_PATH, alt)
+        DB_PATH = alt
+
+def _copy_existing_db_to_path(src: str, dst: str) -> None:
+    """
+    Copy an existing SQLite DB to fallback path using SQLite backup when possible.
+    """
+    src_abs = os.path.abspath(src)
+    dst_abs = os.path.abspath(dst)
+    if not os.path.exists(src_abs):
+        return
+    os.makedirs(os.path.dirname(dst_abs) or ".", exist_ok=True)
+    src_uri = f"file:{src_abs}?mode=ro"
+    try:
+        with sqlite3.connect(src_uri, uri=True) as src_conn:
+            with sqlite3.connect(dst_abs) as dst_conn:
+                src_conn.backup(dst_conn)
+        logger.warning("Copied existing DB data to writable fallback: %s -> %s", src_abs, dst_abs)
+        return
+    except Exception:
+        logger.exception("SQLite backup copy failed from %s to %s; trying file copy.", src_abs, dst_abs)
+    try:
+        shutil.copy2(src_abs, dst_abs)
+        logger.warning("Copied DB file to writable fallback via file copy: %s -> %s", src_abs, dst_abs)
+    except Exception:
+        logger.exception("Failed to copy DB file from %s to %s", src_abs, dst_abs)
+
 def _is_db_dir_writable(path: str) -> bool:
     abs_path = os.path.abspath(path)
     dir_path = os.path.dirname(abs_path) or "."
@@ -184,6 +260,7 @@ def _ensure_writable_db_path() -> None:
     global DB_PATH
     if _is_db_dir_writable(DB_PATH):
         return
+    source_path = DB_PATH
     base_name = os.path.basename(DB_PATH) or "tg_content.db"
     fallback_dir = os.environ.get("DB_FALLBACK_DIR", "/tmp").strip() or "/tmp"
     fallback_path = os.path.join(fallback_dir, base_name)
@@ -191,6 +268,8 @@ def _ensure_writable_db_path() -> None:
         raise RuntimeError(
             f"DB path is not writable: {DB_PATH}. Fallback is also not writable: {fallback_path}"
         )
+    if os.path.abspath(source_path) != os.path.abspath(fallback_path) and not os.path.exists(fallback_path):
+        _copy_existing_db_to_path(source_path, fallback_path)
     logger.warning("DB path %s is read-only. Using writable fallback DB path: %s", DB_PATH, fallback_path)
     DB_PATH = fallback_path
 
@@ -281,6 +360,7 @@ def _quarantine_corrupt_db_files() -> None:
 
 def init_db() -> None:
     global DB_PATH
+    _resolve_existing_db_path()
     _ensure_writable_db_path()
     conn = None
     try:
