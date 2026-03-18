@@ -89,7 +89,7 @@ def kaith_heathcheck_typo():
 @app.route("/telegram/webhook", methods=["POST"])
 def telegram_webhook():
     ensure_bot_started_in_background()
-    if _runtime_mode != "webhook":
+    if _runtime_mode == "polling":
         return "Webhook mode is disabled.", 409
     if not _webhook_ready.is_set():
         if not _webhook_ready.wait(timeout=WEBHOOK_STARTUP_WAIT_SECONDS):
@@ -1137,18 +1137,21 @@ async def _process_webhook_update(payload: Dict[str, Any]) -> None:
 
 async def _start_webhook_runtime() -> None:
     webhook_url = _build_webhook_url()
-    if not webhook_url:
-        raise RuntimeError("WEBHOOK_BASE_URL is required for webhook mode.")
     if _telegram_app is None:
         raise RuntimeError("Telegram app is not initialized.")
     await _telegram_app.initialize()
     await _telegram_app.start()
-    kwargs: Dict[str, Any] = {"url": webhook_url, "drop_pending_updates": False}
-    if WEBHOOK_SECRET:
-        kwargs["secret_token"] = WEBHOOK_SECRET
-    await _telegram_app.bot.set_webhook(**kwargs)
+    if webhook_url:
+        kwargs: Dict[str, Any] = {"url": webhook_url, "drop_pending_updates": False}
+        if WEBHOOK_SECRET:
+            kwargs["secret_token"] = WEBHOOK_SECRET
+        await _telegram_app.bot.set_webhook(**kwargs)
+        logger.info("Webhook registered at %s", webhook_url)
+    else:
+        logger.warning(
+            "WEBHOOK_BASE_URL is not set. Skipping set_webhook; assuming it is already configured on Telegram."
+        )
     _webhook_ready.set()
-    logger.info("Webhook registered at %s", webhook_url)
 
 def _webhook_loop_worker():
     global _telegram_loop, _bot_started, _runtime_mode, _telegram_app
@@ -1200,14 +1203,11 @@ def run_telegram_bot():
         )
 
         if requested_mode == "webhook":
-            webhook_url = _build_webhook_url()
-            if webhook_url:
-                _runtime_mode = "webhook"
-                _bot_thread = Thread(target=_webhook_loop_worker, name="telegram-webhook", daemon=True)
-                _bot_thread.start()
-                logger.info("Upload+View Bot starting in webhook mode...")
-                return
-            logger.warning("TELEGRAM_MODE=webhook but WEBHOOK_BASE_URL is missing. Falling back to polling.")
+            _runtime_mode = "webhook"
+            _bot_thread = Thread(target=_webhook_loop_worker, name="telegram-webhook", daemon=True)
+            _bot_thread.start()
+            logger.info("Upload+View Bot starting in webhook mode...")
+            return
 
         _runtime_mode = "polling"
         logger.info("Upload+View Bot starting in polling mode...")
