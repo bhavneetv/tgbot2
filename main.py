@@ -45,14 +45,25 @@ from telegram.ext import (
 )
 
 from flask import Flask
-from threading import Thread
+from threading import Thread, Lock
 
 # ----------------- Flask health endpoint (keeps renders/pella happy) -----------------
 app = Flask('')
 
+_bot_start_lock = Lock()
+_bot_started = False
+_bot_thread: Optional[Thread] = None
+
 @app.route('/')
 def home():
+    # For Gunicorn deployments (main:app), bootstrap polling lazily on first hit.
+    ensure_bot_started_in_background()
     return "Bot is running!"
+
+@app.route('/health')
+def health():
+    ensure_bot_started_in_background()
+    return {"ok": True, "bot_started": _bot_started}
 
 def run():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", "8080")))
@@ -990,48 +1001,76 @@ async def cmd_myinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"⏳ Password valid for another {hrs}h {mins}m {secs}s.")
 
 # Utility to register handlers and run
+def run_telegram_bot():
+    global _bot_started
+    with _bot_start_lock:
+        if _bot_started:
+            logger.info("Telegram polling already started; skipping duplicate start.")
+            return
+        _bot_started = True
+    try:
+        init_db()
+        load_password_from_db()
+        load_protection_from_db()
+        tg_app = ApplicationBuilder().token(UPLOAD_BOT_TOKEN).build()
+
+        conv = ConversationHandler(
+            entry_points=[CommandHandler("upload", cmd_upload)],
+            states={
+                STATE_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, password_text)],
+                STATE_THUMBNAIL: [MessageHandler(filters.PHOTO & ~filters.COMMAND, thumbnail_handler), CommandHandler("cancel", cancel_command)],
+                STATE_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, description_handler), CommandHandler("cancel", cancel_command)],
+                STATE_OPTION: [CallbackQueryHandler(option_pressed)],
+                STATE_MEDIA_UPLOAD: [
+                    MessageHandler((filters.PHOTO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, media_receiver),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, url_text_receive),
+                    CommandHandler("done", done_receiving_media),
+                    CommandHandler("cancel", cancel_command),
+                ],
+                STATE_CONFIRM_TOKEN: [CallbackQueryHandler(token_choice_callback)],
+            },
+            fallbacks=[CommandHandler("cancel", cancel_command)],
+            allow_reentry=True,
+        )
+
+        tg_app.add_handler(CommandHandler("start", start))
+        tg_app.add_handler(conv)
+        # Original option handlers
+        tg_app.add_handler(CallbackQueryHandler(option_pressed, pattern="^opt_"))
+        tg_app.add_handler(CallbackQueryHandler(token_choice_callback, pattern="^tok_"))
+        # Use improved token handler (creates token link, but activation only on /start)
+        tg_app.add_handler(CallbackQueryHandler(callback_get_token_exeio, pattern="^gettok_"))
+
+        # admin & misc commands
+        tg_app.add_handler(CommandHandler("addvip", cmd_addvip))
+        tg_app.add_handler(CommandHandler("delvip", cmd_delvip))
+        tg_app.add_handler(CommandHandler("changepass", cmd_changepass))
+        tg_app.add_handler(CommandHandler("myinfo", cmd_myinfo))
+        tg_app.add_handler(CommandHandler("protection", cmd_protection))
+
+        logger.info("Upload+View Bot starting...")
+        tg_app.run_polling()
+    except Exception:
+        with _bot_start_lock:
+            _bot_started = False
+        logger.exception("Telegram bot failed to start.")
+        raise
+
+def ensure_bot_started_in_background():
+    global _bot_thread
+    auto_start = os.environ.get("START_BOT_WITH_GUNICORN", "1").strip().lower() not in ("0", "false", "no")
+    if not auto_start:
+        return
+    with _bot_start_lock:
+        if _bot_started:
+            return
+        if _bot_thread and _bot_thread.is_alive():
+            return
+        _bot_thread = Thread(target=run_telegram_bot, name="telegram-polling", daemon=True)
+        _bot_thread.start()
+
 def main():
-    init_db()
-    load_password_from_db()
-    load_protection_from_db()
-    app = ApplicationBuilder().token(UPLOAD_BOT_TOKEN).build()
-
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("upload", cmd_upload)],
-        states={
-            STATE_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, password_text)],
-            STATE_THUMBNAIL: [MessageHandler(filters.PHOTO & ~filters.COMMAND, thumbnail_handler), CommandHandler("cancel", cancel_command)],
-            STATE_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, description_handler), CommandHandler("cancel", cancel_command)],
-            STATE_OPTION: [CallbackQueryHandler(option_pressed)],
-            STATE_MEDIA_UPLOAD: [
-                MessageHandler((filters.PHOTO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, media_receiver),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, url_text_receive),
-                CommandHandler("done", done_receiving_media),
-                CommandHandler("cancel", cancel_command),
-            ],
-            STATE_CONFIRM_TOKEN: [CallbackQueryHandler(token_choice_callback)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_command)],
-        allow_reentry=True,
-    )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv)
-    # Original option handlers
-    app.add_handler(CallbackQueryHandler(option_pressed, pattern="^opt_"))
-    app.add_handler(CallbackQueryHandler(token_choice_callback, pattern="^tok_"))
-    # Use improved token handler (creates token link, but activation only on /start)
-    app.add_handler(CallbackQueryHandler(callback_get_token_exeio, pattern="^gettok_"))
-
-    # admin & misc commands
-    app.add_handler(CommandHandler("addvip", cmd_addvip))
-    app.add_handler(CommandHandler("delvip", cmd_delvip))
-    app.add_handler(CommandHandler("changepass", cmd_changepass))
-    app.add_handler(CommandHandler("myinfo", cmd_myinfo))
-    app.add_handler(CommandHandler("protection", cmd_protection))
-
-    logger.info("Upload+View Bot starting...")
-    app.run_polling()
+    run_telegram_bot()
 
 if __name__ == "__main__":
     # Only run Flask's built-in server for local/direct execution.
@@ -1040,4 +1079,4 @@ if __name__ == "__main__":
     t = Thread(target=run)
     t.daemon = True
     t.start()
-    main()
+    run_telegram_bot()
