@@ -46,7 +46,7 @@ from telegram.ext import (
 )
 
 from flask import Flask, request
-from threading import Thread, Lock
+from threading import Thread, Lock, Event
 
 # ----------------- Flask health endpoint (keeps renders/pella happy) -----------------
 app = Flask('')
@@ -57,6 +57,7 @@ _bot_thread: Optional[Thread] = None
 _runtime_mode = "stopped"
 _telegram_app = None
 _telegram_loop = None
+_webhook_ready = Event()
 
 def _log_webhook_task_result(future):
     try:
@@ -88,10 +89,12 @@ def kaith_heathcheck_typo():
 @app.route("/telegram/webhook", methods=["POST"])
 def telegram_webhook():
     ensure_bot_started_in_background()
-    if TELEGRAM_MODE == "webhook" and _runtime_mode == "stopped":
-        return "Bot is starting up.", 503
     if _runtime_mode != "webhook":
         return "Webhook mode is disabled.", 409
+    if not _webhook_ready.is_set():
+        if not _webhook_ready.wait(timeout=WEBHOOK_STARTUP_WAIT_SECONDS):
+            logger.warning("Webhook request received before runtime became ready.")
+            return "Bot is starting up.", 503
     if WEBHOOK_SECRET:
         got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
         if got != WEBHOOK_SECRET:
@@ -124,10 +127,11 @@ ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "6233731222").split(","
 EXEIO_API_KEY = os.environ.get("EXEIO_API_KEY", "c204899d0187dc988e3d368d21038fbf82789531").strip()
 EXEIO_API_ENDPOINT = os.environ.get("EXEIO_API_ENDPOINT", "https://exe.io/api")
 TELEGRAM_MODE = os.environ.get("TELEGRAM_MODE", "webhook").strip().lower()
-WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "https://tgbot2-idfake3097-jgiasqpt.leapcell.dev/").strip().rstrip("/")
+WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "").strip().rstrip("/")
 WEBHOOK_PATH = "/telegram/webhook"
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "a").strip()
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
 WEBHOOK_PROCESS_TIMEOUT_SECONDS = float(os.environ.get("WEBHOOK_PROCESS_TIMEOUT_SECONDS", "8"))
+WEBHOOK_STARTUP_WAIT_SECONDS = float(os.environ.get("WEBHOOK_STARTUP_WAIT_SECONDS", "8"))
 
 # default runtime flag; actual value loaded from DB settings at startup
 content_protection = True
@@ -1143,6 +1147,7 @@ async def _start_webhook_runtime() -> None:
     if WEBHOOK_SECRET:
         kwargs["secret_token"] = WEBHOOK_SECRET
     await _telegram_app.bot.set_webhook(**kwargs)
+    _webhook_ready.set()
     logger.info("Webhook registered at %s", webhook_url)
 
 def _webhook_loop_worker():
@@ -1159,6 +1164,7 @@ def _webhook_loop_worker():
         _runtime_mode = "stopped"
         logger.exception("Webhook runtime crashed.")
     finally:
+        _webhook_ready.clear()
         if _telegram_app is not None:
             try:
                 loop.run_until_complete(_telegram_app.stop())
@@ -1180,6 +1186,7 @@ def run_telegram_bot():
             logger.info("Telegram runtime already started; skipping duplicate start.")
             return
         _bot_started = True
+    _webhook_ready.clear()
     try:
         init_db()
         load_password_from_db()
@@ -1209,6 +1216,7 @@ def run_telegram_bot():
         with _bot_start_lock:
             _bot_started = False
         _runtime_mode = "stopped"
+        _webhook_ready.clear()
         logger.exception("Telegram bot failed to start.")
         raise
 
