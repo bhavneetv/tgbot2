@@ -44,6 +44,8 @@ from telegram.ext import (
     ConversationHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
+from telegram.error import TimedOut, NetworkError
 
 from flask import Flask, request
 from threading import Thread, Lock, Event
@@ -58,12 +60,6 @@ _runtime_mode = "stopped"
 _telegram_app = None
 _telegram_loop = None
 _webhook_ready = Event()
-
-def _log_webhook_task_result(future):
-    try:
-        future.result()
-    except Exception:
-        logger.exception("Webhook update task failed.")
 
 @app.route('/')
 def home():
@@ -106,7 +102,10 @@ def telegram_webhook():
         return "Bot is not ready yet.", 503
     try:
         future = asyncio.run_coroutine_threadsafe(_process_webhook_update(payload), _telegram_loop)
-        future.add_done_callback(_log_webhook_task_result)
+        future.result(timeout=WEBHOOK_PROCESS_TIMEOUT_SECONDS)
+    except (TimedOut, NetworkError):
+        logger.warning("Telegram API timeout/network error while processing webhook update; asking Telegram to retry.")
+        return "Temporary upstream error", 500
     except Exception:
         logger.exception("Failed to process webhook update.")
         return "Failed to process update", 500
@@ -130,8 +129,13 @@ TELEGRAM_MODE = os.environ.get("TELEGRAM_MODE", "webhook").strip().lower()
 WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "https://tgbot2-idfake3097-jgiasqpt.leapcell.dev/").strip().rstrip("/")
 WEBHOOK_PATH = "/telegram/webhook"
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
-WEBHOOK_PROCESS_TIMEOUT_SECONDS = float(os.environ.get("WEBHOOK_PROCESS_TIMEOUT_SECONDS", "8"))
+WEBHOOK_PROCESS_TIMEOUT_SECONDS = float(os.environ.get("WEBHOOK_PROCESS_TIMEOUT_SECONDS", "9"))
 WEBHOOK_STARTUP_WAIT_SECONDS = float(os.environ.get("WEBHOOK_STARTUP_WAIT_SECONDS", "8"))
+TELEGRAM_CONNECT_TIMEOUT_SECONDS = float(os.environ.get("TELEGRAM_CONNECT_TIMEOUT_SECONDS", "20"))
+TELEGRAM_READ_TIMEOUT_SECONDS = float(os.environ.get("TELEGRAM_READ_TIMEOUT_SECONDS", "30"))
+TELEGRAM_WRITE_TIMEOUT_SECONDS = float(os.environ.get("TELEGRAM_WRITE_TIMEOUT_SECONDS", "30"))
+TELEGRAM_POOL_TIMEOUT_SECONDS = float(os.environ.get("TELEGRAM_POOL_TIMEOUT_SECONDS", "15"))
+TELEGRAM_CONNECTION_POOL_SIZE = int(os.environ.get("TELEGRAM_CONNECTION_POOL_SIZE", "32"))
 
 # default runtime flag; actual value loaded from DB settings at startup
 content_protection = True
@@ -1092,7 +1096,14 @@ def _build_webhook_url() -> Optional[str]:
     return f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
 
 def build_telegram_application():
-    tg_app = ApplicationBuilder().token(UPLOAD_BOT_TOKEN).build()
+    request = HTTPXRequest(
+        connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
+        read_timeout=TELEGRAM_READ_TIMEOUT_SECONDS,
+        write_timeout=TELEGRAM_WRITE_TIMEOUT_SECONDS,
+        pool_timeout=TELEGRAM_POOL_TIMEOUT_SECONDS,
+        connection_pool_size=TELEGRAM_CONNECTION_POOL_SIZE,
+    )
+    tg_app = ApplicationBuilder().token(UPLOAD_BOT_TOKEN).request(request).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("upload", cmd_upload)],
