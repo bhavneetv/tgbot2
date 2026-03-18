@@ -73,7 +73,7 @@ UPLOAD_BOT_TOKEN = os.environ.get("UPLOAD_BOT_TOKEN", "8413595718:AAEI8yJAcDt22V
 MAIN_CHANNEL_ID = os.environ.get("MAIN_CHANNEL_ID", "-1003104322226")
 PASSWORD = os.environ.get("UPLOAD_PASSWORD", "test")
 PASSWORD_VALID_SECONDS = int(os.environ.get("PASSWORD_VALID_SECONDS", 24 * 3600))
-DB_PATH = os.environ.get("DB_PATH", "tg_content.db")
+DB_PATH = os.environ.get("DB_PATH", "tg_content-old.db")
 ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "6233731222").split(",") if x.strip().isdigit()]
 
 EXEIO_API_KEY = os.environ.get("EXEIO_API_KEY", "c204899d0187dc988e3d368d21038fbf82789531").strip()
