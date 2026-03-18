@@ -24,6 +24,7 @@ import logging
 import secrets
 import sqlite3
 import urllib
+import asyncio
 from typing import Dict, Any, List, Optional
 
 import aiohttp
@@ -44,7 +45,7 @@ from telegram.ext import (
     filters,
 )
 
-from flask import Flask
+from flask import Flask, request
 from threading import Thread, Lock
 
 # ----------------- Flask health endpoint (keeps renders/pella happy) -----------------
@@ -53,17 +54,50 @@ app = Flask('')
 _bot_start_lock = Lock()
 _bot_started = False
 _bot_thread: Optional[Thread] = None
+_runtime_mode = "stopped"
+_telegram_app = None
+_telegram_loop = None
+
+def _log_webhook_task_result(future):
+    try:
+        future.result()
+    except Exception:
+        logger.exception("Webhook update task failed.")
 
 @app.route('/')
 def home():
-    # For Gunicorn deployments (main:app), bootstrap polling lazily on first hit.
+    # For Gunicorn deployments (main:app), bootstrap bot runtime lazily on first hit.
     ensure_bot_started_in_background()
     return "Bot is running!"
 
 @app.route('/health')
 def health():
     ensure_bot_started_in_background()
-    return {"ok": True, "bot_started": _bot_started}
+    return {"ok": True, "bot_started": _bot_started, "mode": _runtime_mode}
+
+@app.route("/telegram/webhook", methods=["POST"])
+def telegram_webhook():
+    ensure_bot_started_in_background()
+    if TELEGRAM_MODE == "webhook" and _runtime_mode == "stopped":
+        return "Bot is starting up.", 503
+    if _runtime_mode != "webhook":
+        return "Webhook mode is disabled.", 409
+    if WEBHOOK_SECRET:
+        got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if got != WEBHOOK_SECRET:
+            return "Forbidden", 403
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return "Invalid payload", 400
+    if _telegram_app is None or _telegram_loop is None:
+        return "Bot is not ready yet.", 503
+    try:
+        future = asyncio.run_coroutine_threadsafe(_process_webhook_update(payload), _telegram_loop)
+        future.add_done_callback(_log_webhook_task_result)
+    except Exception:
+        logger.exception("Failed to process webhook update.")
+        return "Failed to process update", 500
+    return "OK", 200
 
 def run():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", "8080")))
@@ -78,6 +112,11 @@ ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "6233731222").split(","
 
 EXEIO_API_KEY = os.environ.get("EXEIO_API_KEY", "c204899d0187dc988e3d368d21038fbf82789531").strip()
 EXEIO_API_ENDPOINT = os.environ.get("EXEIO_API_ENDPOINT", "https://exe.io/api")
+TELEGRAM_MODE = os.environ.get("TELEGRAM_MODE", "webhook").strip().lower()
+WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "https://tgbot2-idfake3097-jgiasqpt.leapcell.dev/").strip().rstrip("/")
+WEBHOOK_PATH = "/telegram/webhook"
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
+WEBHOOK_PROCESS_TIMEOUT_SECONDS = float(os.environ.get("WEBHOOK_PROCESS_TIMEOUT_SECONDS", "8"))
 
 # default runtime flag; actual value loaded from DB settings at startup
 content_protection = True
@@ -103,8 +142,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ----------------- DB helpers -----------------
-def init_db() -> None:
-    conn = sqlite3.connect(DB_PATH)
+def _apply_db_schema(conn: sqlite3.Connection) -> None:
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS users(
         user_id INTEGER PRIMARY KEY,
@@ -157,6 +195,39 @@ def init_db() -> None:
         key TEXT PRIMARY KEY,
         value TEXT
     )""")
+
+def _quarantine_corrupt_db_files() -> None:
+    ts = int(time.time())
+    for suffix in ("", "-wal", "-shm"):
+        src = f"{DB_PATH}{suffix}"
+        if not os.path.exists(src):
+            continue
+        dst = f"{DB_PATH}.corrupt-{ts}{suffix}"
+        try:
+            os.replace(src, dst)
+            logger.warning("Moved corrupt SQLite file: %s -> %s", src, dst)
+        except Exception:
+            logger.exception("Failed to move corrupt SQLite file: %s", src)
+
+def init_db() -> None:
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        _apply_db_schema(conn)
+        conn.commit()
+        conn.close()
+        return
+    except sqlite3.DatabaseError as e:
+        if conn:
+            conn.close()
+        error_text = str(e).lower()
+        if "malformed" not in error_text and "disk image" not in error_text:
+            raise
+        logger.exception("SQLite DB is corrupted. Recreating DB.")
+        _quarantine_corrupt_db_files()
+    # Recreate a fresh DB when old one is malformed.
+    conn = sqlite3.connect(DB_PATH)
+    _apply_db_schema(conn)
     conn.commit()
     conn.close()
 
@@ -1000,59 +1071,128 @@ async def cmd_myinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     secs = remaining % 60
     await update.message.reply_text(f"⏳ Password valid for another {hrs}h {mins}m {secs}s.")
 
+def _build_webhook_url() -> Optional[str]:
+    if not WEBHOOK_BASE_URL:
+        return None
+    return f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
+
+def build_telegram_application():
+    tg_app = ApplicationBuilder().token(UPLOAD_BOT_TOKEN).build()
+
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("upload", cmd_upload)],
+        states={
+            STATE_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, password_text)],
+            STATE_THUMBNAIL: [MessageHandler(filters.PHOTO & ~filters.COMMAND, thumbnail_handler), CommandHandler("cancel", cancel_command)],
+            STATE_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, description_handler), CommandHandler("cancel", cancel_command)],
+            STATE_OPTION: [CallbackQueryHandler(option_pressed)],
+            STATE_MEDIA_UPLOAD: [
+                MessageHandler((filters.PHOTO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, media_receiver),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, url_text_receive),
+                CommandHandler("done", done_receiving_media),
+                CommandHandler("cancel", cancel_command),
+            ],
+            STATE_CONFIRM_TOKEN: [CallbackQueryHandler(token_choice_callback)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_command)],
+        allow_reentry=True,
+    )
+
+    tg_app.add_handler(CommandHandler("start", start))
+    tg_app.add_handler(conv)
+    # Original option handlers
+    tg_app.add_handler(CallbackQueryHandler(option_pressed, pattern="^opt_"))
+    tg_app.add_handler(CallbackQueryHandler(token_choice_callback, pattern="^tok_"))
+    # Use improved token handler (creates token link, but activation only on /start)
+    tg_app.add_handler(CallbackQueryHandler(callback_get_token_exeio, pattern="^gettok_"))
+
+    # admin & misc commands
+    tg_app.add_handler(CommandHandler("addvip", cmd_addvip))
+    tg_app.add_handler(CommandHandler("delvip", cmd_delvip))
+    tg_app.add_handler(CommandHandler("changepass", cmd_changepass))
+    tg_app.add_handler(CommandHandler("myinfo", cmd_myinfo))
+    tg_app.add_handler(CommandHandler("protection", cmd_protection))
+    return tg_app
+
+async def _process_webhook_update(payload: Dict[str, Any]) -> None:
+    if _telegram_app is None:
+        raise RuntimeError("Telegram app is not initialized.")
+    update = Update.de_json(payload, _telegram_app.bot)
+    await _telegram_app.process_update(update)
+
+async def _start_webhook_runtime() -> None:
+    webhook_url = _build_webhook_url()
+    if not webhook_url:
+        raise RuntimeError("WEBHOOK_BASE_URL is required for webhook mode.")
+    if _telegram_app is None:
+        raise RuntimeError("Telegram app is not initialized.")
+    await _telegram_app.initialize()
+    await _telegram_app.start()
+    kwargs: Dict[str, Any] = {"url": webhook_url, "drop_pending_updates": False}
+    if WEBHOOK_SECRET:
+        kwargs["secret_token"] = WEBHOOK_SECRET
+    await _telegram_app.bot.set_webhook(**kwargs)
+    logger.info("Webhook registered at %s", webhook_url)
+
+def _webhook_loop_worker():
+    global _telegram_loop, _bot_started, _runtime_mode, _telegram_app
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    _telegram_loop = loop
+    try:
+        loop.run_until_complete(_start_webhook_runtime())
+        loop.run_forever()
+    except Exception:
+        with _bot_start_lock:
+            _bot_started = False
+        _runtime_mode = "stopped"
+        logger.exception("Webhook runtime crashed.")
+    finally:
+        if _telegram_app is not None:
+            try:
+                loop.run_until_complete(_telegram_app.stop())
+            except Exception:
+                logger.exception("Failed to stop telegram app cleanly.")
+            try:
+                loop.run_until_complete(_telegram_app.shutdown())
+            except Exception:
+                logger.exception("Failed to shutdown telegram app cleanly.")
+        loop.close()
+        _telegram_loop = None
+        _telegram_app = None
+
 # Utility to register handlers and run
 def run_telegram_bot():
-    global _bot_started
+    global _bot_started, _runtime_mode, _telegram_app, _bot_thread
     with _bot_start_lock:
         if _bot_started:
-            logger.info("Telegram polling already started; skipping duplicate start.")
+            logger.info("Telegram runtime already started; skipping duplicate start.")
             return
         _bot_started = True
     try:
         init_db()
         load_password_from_db()
         load_protection_from_db()
-        tg_app = ApplicationBuilder().token(UPLOAD_BOT_TOKEN).build()
+        _telegram_app = build_telegram_application()
+        requested_mode = TELEGRAM_MODE if TELEGRAM_MODE in ("webhook", "polling") else "webhook"
 
-        conv = ConversationHandler(
-            entry_points=[CommandHandler("upload", cmd_upload)],
-            states={
-                STATE_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, password_text)],
-                STATE_THUMBNAIL: [MessageHandler(filters.PHOTO & ~filters.COMMAND, thumbnail_handler), CommandHandler("cancel", cancel_command)],
-                STATE_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, description_handler), CommandHandler("cancel", cancel_command)],
-                STATE_OPTION: [CallbackQueryHandler(option_pressed)],
-                STATE_MEDIA_UPLOAD: [
-                    MessageHandler((filters.PHOTO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, media_receiver),
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, url_text_receive),
-                    CommandHandler("done", done_receiving_media),
-                    CommandHandler("cancel", cancel_command),
-                ],
-                STATE_CONFIRM_TOKEN: [CallbackQueryHandler(token_choice_callback)],
-            },
-            fallbacks=[CommandHandler("cancel", cancel_command)],
-            allow_reentry=True,
-        )
+        if requested_mode == "webhook":
+            webhook_url = _build_webhook_url()
+            if webhook_url:
+                _runtime_mode = "webhook"
+                _bot_thread = Thread(target=_webhook_loop_worker, name="telegram-webhook", daemon=True)
+                _bot_thread.start()
+                logger.info("Upload+View Bot starting in webhook mode...")
+                return
+            logger.warning("TELEGRAM_MODE=webhook but WEBHOOK_BASE_URL is missing. Falling back to polling.")
 
-        tg_app.add_handler(CommandHandler("start", start))
-        tg_app.add_handler(conv)
-        # Original option handlers
-        tg_app.add_handler(CallbackQueryHandler(option_pressed, pattern="^opt_"))
-        tg_app.add_handler(CallbackQueryHandler(token_choice_callback, pattern="^tok_"))
-        # Use improved token handler (creates token link, but activation only on /start)
-        tg_app.add_handler(CallbackQueryHandler(callback_get_token_exeio, pattern="^gettok_"))
-
-        # admin & misc commands
-        tg_app.add_handler(CommandHandler("addvip", cmd_addvip))
-        tg_app.add_handler(CommandHandler("delvip", cmd_delvip))
-        tg_app.add_handler(CommandHandler("changepass", cmd_changepass))
-        tg_app.add_handler(CommandHandler("myinfo", cmd_myinfo))
-        tg_app.add_handler(CommandHandler("protection", cmd_protection))
-
-        logger.info("Upload+View Bot starting...")
-        tg_app.run_polling()
+        _runtime_mode = "polling"
+        logger.info("Upload+View Bot starting in polling mode...")
+        _telegram_app.run_polling(drop_pending_updates=False)
     except Exception:
         with _bot_start_lock:
             _bot_started = False
+        _runtime_mode = "stopped"
         logger.exception("Telegram bot failed to start.")
         raise
 
@@ -1066,17 +1206,28 @@ def ensure_bot_started_in_background():
             return
         if _bot_thread and _bot_thread.is_alive():
             return
-        _bot_thread = Thread(target=run_telegram_bot, name="telegram-polling", daemon=True)
+        _bot_thread = Thread(target=run_telegram_bot, name="telegram-runtime", daemon=True)
         _bot_thread.start()
 
 def main():
     run_telegram_bot()
 
+def _should_autostart_on_import() -> bool:
+    enabled = os.environ.get("AUTO_START_BOT_ON_IMPORT", "1").strip().lower() not in ("0", "false", "no")
+    return enabled and __name__ != "__main__"
+
+if _should_autostart_on_import():
+    # Gunicorn imports `main:app`; start bot runtime immediately so webhook gets registered.
+    ensure_bot_started_in_background()
+
 if __name__ == "__main__":
-    # Only run Flask's built-in server for local/direct execution.
-    # Under Gunicorn, this file is imported, so starting app.run() there
-    # would cause "Address already in use" on the same PORT.
-    t = Thread(target=run)
-    t.daemon = True
-    t.start()
-    run_telegram_bot()
+    if TELEGRAM_MODE == "webhook":
+        # Local webhook mode: keep Flask in foreground and telegram runtime in background.
+        ensure_bot_started_in_background()
+        run()
+    else:
+        # Local polling mode: keep polling loop in foreground and Flask health server in background.
+        t = Thread(target=run)
+        t.daemon = True
+        t.start()
+        run_telegram_bot()
