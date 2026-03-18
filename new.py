@@ -24,6 +24,7 @@ import logging
 import secrets
 import sqlite3
 import urllib
+import asyncio
 from typing import Dict, Any, List, Optional
 
 import aiohttp
@@ -43,23 +44,74 @@ from telegram.ext import (
     ConversationHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
+from telegram.error import TimedOut, NetworkError
 
-from flask import Flask
-from threading import Thread
+from flask import Flask, request
+from threading import Thread, Lock, Event
 
 # ----------------- Flask health endpoint (keeps renders/pella happy) -----------------
 app = Flask('')
 
+_bot_start_lock = Lock()
+_bot_started = False
+_bot_thread: Optional[Thread] = None
+_runtime_mode = "stopped"
+_telegram_app = None
+_telegram_loop = None
+_webhook_ready = Event()
+
 @app.route('/')
 def home():
+    ensure_bot_started_in_background()
     return "Bot is running!"
+
+@app.route('/health')
+def health():
+    ensure_bot_started_in_background()
+    return {"ok": True, "bot_started": _bot_started, "mode": _runtime_mode}
+
+@app.route("/kaithhealthcheck")
+def kaith_healthcheck():
+    ensure_bot_started_in_background()
+    return "ok", 200
+
+@app.route("/kaithheathcheck")
+def kaith_heathcheck_typo():
+    ensure_bot_started_in_background()
+    return "ok", 200
+
+@app.route("/telegram/webhook", methods=["POST"])
+def telegram_webhook():
+    ensure_bot_started_in_background()
+    if _runtime_mode == "polling":
+        return "Webhook mode is disabled.", 409
+    if not _webhook_ready.is_set():
+        if not _webhook_ready.wait(timeout=WEBHOOK_STARTUP_WAIT_SECONDS):
+            logger.warning("Webhook request received before runtime became ready.")
+            return "Bot is starting up.", 503
+    if WEBHOOK_SECRET:
+        got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if got != WEBHOOK_SECRET:
+            return "Forbidden", 403
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return "Invalid payload", 400
+    if _telegram_app is None or _telegram_loop is None:
+        return "Bot is not ready yet.", 503
+    try:
+        future = asyncio.run_coroutine_threadsafe(_process_webhook_update(payload), _telegram_loop)
+        future.result(timeout=WEBHOOK_PROCESS_TIMEOUT_SECONDS)
+    except (TimedOut, NetworkError):
+        logger.warning("Telegram API timeout/network error while processing webhook update; asking Telegram to retry.")
+        return "Temporary upstream error", 500
+    except Exception:
+        logger.exception("Failed to process webhook update.")
+        return "Failed to process update", 500
+    return "OK", 200
 
 def run():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", "8080")))
-
-t = Thread(target=run)
-t.daemon = True
-t.start()
 
 # ---------- CONFIG (ENV-friendly) ----------
 UPLOAD_BOT_TOKEN = os.environ.get("UPLOAD_BOT_TOKEN", "8413595718:AAEI8yJAcDt22VbzASEpNR_aJNMXrMscdGk")
@@ -73,6 +125,17 @@ OWNER_ID = ADMIN_IDS[0] if ADMIN_IDS else None
 EXEIO_API_KEY = os.environ.get("EXEIO_API_KEY", "c204899d0187dc988e3d368d21038fbf82789531").strip()
 EXEIO_API_ENDPOINT = os.environ.get("EXEIO_API_ENDPOINT", "https://exe.io/api")
 EXEIO_TIMEOUT_SECONDS = float(os.environ.get("EXEIO_TIMEOUT_SECONDS", "3.5"))
+TELEGRAM_MODE = os.environ.get("TELEGRAM_MODE", "webhook").strip().lower()
+WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "").strip().rstrip("/")
+WEBHOOK_PATH = "/telegram/webhook"
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
+WEBHOOK_PROCESS_TIMEOUT_SECONDS = float(os.environ.get("WEBHOOK_PROCESS_TIMEOUT_SECONDS", "9"))
+WEBHOOK_STARTUP_WAIT_SECONDS = float(os.environ.get("WEBHOOK_STARTUP_WAIT_SECONDS", "8"))
+TELEGRAM_CONNECT_TIMEOUT_SECONDS = float(os.environ.get("TELEGRAM_CONNECT_TIMEOUT_SECONDS", "20"))
+TELEGRAM_READ_TIMEOUT_SECONDS = float(os.environ.get("TELEGRAM_READ_TIMEOUT_SECONDS", "30"))
+TELEGRAM_WRITE_TIMEOUT_SECONDS = float(os.environ.get("TELEGRAM_WRITE_TIMEOUT_SECONDS", "30"))
+TELEGRAM_POOL_TIMEOUT_SECONDS = float(os.environ.get("TELEGRAM_POOL_TIMEOUT_SECONDS", "15"))
+TELEGRAM_CONNECTION_POOL_SIZE = int(os.environ.get("TELEGRAM_CONNECTION_POOL_SIZE", "32"))
 
 # default runtime flag; actual value loaded from DB settings at startup
 content_protection = True
@@ -1391,8 +1454,20 @@ async def cmd_myinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"⏳ Password valid for another {hrs}h {mins}m {secs}s.")
 
 # Utility to register handlers and run
+def _build_webhook_url() -> Optional[str]:
+    if not WEBHOOK_BASE_URL:
+        return None
+    return f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
+
 def build_telegram_application():
-    tg_app = ApplicationBuilder().token(UPLOAD_BOT_TOKEN).build()
+    tg_request = HTTPXRequest(
+        connect_timeout=TELEGRAM_CONNECT_TIMEOUT_SECONDS,
+        read_timeout=TELEGRAM_READ_TIMEOUT_SECONDS,
+        write_timeout=TELEGRAM_WRITE_TIMEOUT_SECONDS,
+        pool_timeout=TELEGRAM_POOL_TIMEOUT_SECONDS,
+        connection_pool_size=TELEGRAM_CONNECTION_POOL_SIZE,
+    )
+    tg_app = ApplicationBuilder().token(UPLOAD_BOT_TOKEN).request(tg_request).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("upload", cmd_upload)],
@@ -1435,13 +1510,128 @@ def build_telegram_application():
     tg_app.add_handler(CommandHandler("protection", cmd_protection))
     return tg_app
 
+async def _process_webhook_update(payload: Dict[str, Any]) -> None:
+    if _telegram_app is None:
+        raise RuntimeError("Telegram app is not initialized.")
+    update = Update.de_json(payload, _telegram_app.bot)
+    await _telegram_app.process_update(update)
+
+async def _start_webhook_runtime() -> None:
+    webhook_url = _build_webhook_url()
+    if _telegram_app is None:
+        raise RuntimeError("Telegram app is not initialized.")
+    await _telegram_app.initialize()
+    await _telegram_app.start()
+    if webhook_url:
+        kwargs: Dict[str, Any] = {"url": webhook_url, "drop_pending_updates": False}
+        if WEBHOOK_SECRET:
+            kwargs["secret_token"] = WEBHOOK_SECRET
+        await _telegram_app.bot.set_webhook(**kwargs)
+        logger.info("Webhook registered at %s", webhook_url)
+    else:
+        logger.warning(
+            "WEBHOOK_BASE_URL is not set. Skipping set_webhook; assuming it is already configured on Telegram."
+        )
+    _webhook_ready.set()
+
+def _webhook_loop_worker():
+    global _telegram_loop, _bot_started, _runtime_mode, _telegram_app
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    _telegram_loop = loop
+    try:
+        loop.run_until_complete(_start_webhook_runtime())
+        loop.run_forever()
+    except Exception:
+        with _bot_start_lock:
+            _bot_started = False
+        _runtime_mode = "stopped"
+        logger.exception("Webhook runtime crashed.")
+    finally:
+        _webhook_ready.clear()
+        if _telegram_app is not None:
+            try:
+                loop.run_until_complete(_telegram_app.stop())
+            except Exception:
+                logger.exception("Failed to stop telegram app cleanly.")
+            try:
+                loop.run_until_complete(_telegram_app.shutdown())
+            except Exception:
+                logger.exception("Failed to shutdown telegram app cleanly.")
+        loop.close()
+        _telegram_loop = None
+        _telegram_app = None
+
+def run_telegram_bot():
+    global _bot_started, _runtime_mode, _telegram_app, _bot_thread
+    with _bot_start_lock:
+        if _bot_started:
+            logger.info("Telegram runtime already started; skipping duplicate start.")
+            return
+        _bot_started = True
+    _webhook_ready.clear()
+    try:
+        init_db()
+        load_password_from_db()
+        load_protection_from_db()
+        _telegram_app = build_telegram_application()
+        requested_mode = TELEGRAM_MODE if TELEGRAM_MODE in ("webhook", "polling") else "webhook"
+        logger.info(
+            "Telegram runtime requested_mode=%s webhook_base_url=%s",
+            requested_mode,
+            WEBHOOK_BASE_URL or "<missing>",
+        )
+
+        if requested_mode == "webhook":
+            _runtime_mode = "webhook"
+            _bot_thread = Thread(target=_webhook_loop_worker, name="telegram-webhook", daemon=True)
+            _bot_thread.start()
+            logger.info("Upload+View Bot starting in webhook mode...")
+            return
+
+        _runtime_mode = "polling"
+        logger.info("Upload+View Bot starting in polling mode...")
+        _telegram_app.run_polling(drop_pending_updates=False)
+    except Exception:
+        with _bot_start_lock:
+            _bot_started = False
+        _runtime_mode = "stopped"
+        _webhook_ready.clear()
+        logger.exception("Telegram bot failed to start.")
+        raise
+
+def ensure_bot_started_in_background():
+    global _bot_thread
+    auto_start = os.environ.get("START_BOT_WITH_GUNICORN", "1").strip().lower() not in ("0", "false", "no")
+    if not auto_start:
+        return
+    with _bot_start_lock:
+        if _bot_started:
+            return
+        if _bot_thread and _bot_thread.is_alive():
+            return
+        _bot_thread = Thread(target=run_telegram_bot, name="telegram-runtime", daemon=True)
+        _bot_thread.start()
+
 def main():
-    init_db()
-    load_password_from_db()
-    load_protection_from_db()
-    tg_app = build_telegram_application()
-    logger.info("Upload+View Bot starting...")
-    tg_app.run_polling()
+    run_telegram_bot()
+
+def _should_autostart_on_import() -> bool:
+    enabled = os.environ.get("AUTO_START_BOT_ON_IMPORT", "1").strip().lower() not in ("0", "false", "no")
+    return enabled and __name__ != "__main__"
+
+if _should_autostart_on_import():
+    # Gunicorn imports `new:app`; start bot runtime immediately so webhook gets registered.
+    ensure_bot_started_in_background()
 
 if __name__ == "__main__":
-    main()
+    if TELEGRAM_MODE == "webhook":
+        # Local webhook mode: keep Flask in foreground and telegram runtime in background.
+        run_telegram_bot()
+        run()
+    else:
+        # Local polling mode: keep polling loop in foreground and Flask health server in background.
+        t = Thread(target=run)
+        t.daemon = True
+        t.start()
+        run_telegram_bot()
