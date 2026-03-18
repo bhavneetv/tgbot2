@@ -75,6 +75,16 @@ def health():
     ensure_bot_started_in_background()
     return {"ok": True, "bot_started": _bot_started, "mode": _runtime_mode}
 
+@app.route("/kaithhealthcheck")
+def kaith_healthcheck():
+    ensure_bot_started_in_background()
+    return "ok", 200
+
+@app.route("/kaithheathcheck")
+def kaith_heathcheck_typo():
+    ensure_bot_started_in_background()
+    return "ok", 200
+
 @app.route("/telegram/webhook", methods=["POST"])
 def telegram_webhook():
     ensure_bot_started_in_background()
@@ -103,6 +113,7 @@ def run():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", "8080")))
 
 # ---------- CONFIG (ENV-friendly) ----------
+
 UPLOAD_BOT_TOKEN = os.environ.get("UPLOAD_BOT_TOKEN", "8413595718:AAEI8yJAcDt22VbzASEpNR_aJNMXrMscdGk")
 MAIN_CHANNEL_ID = os.environ.get("MAIN_CHANNEL_ID", "-1003104322226")
 PASSWORD = os.environ.get("UPLOAD_PASSWORD", "test")
@@ -115,7 +126,7 @@ EXEIO_API_ENDPOINT = os.environ.get("EXEIO_API_ENDPOINT", "https://exe.io/api")
 TELEGRAM_MODE = os.environ.get("TELEGRAM_MODE", "webhook").strip().lower()
 WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "https://tgbot2-idfake3097-jgiasqpt.leapcell.dev/").strip().rstrip("/")
 WEBHOOK_PATH = "/telegram/webhook"
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "a").strip()
 WEBHOOK_PROCESS_TIMEOUT_SECONDS = float(os.environ.get("WEBHOOK_PROCESS_TIMEOUT_SECONDS", "8"))
 
 # default runtime flag; actual value loaded from DB settings at startup
@@ -1175,6 +1186,11 @@ def run_telegram_bot():
         load_protection_from_db()
         _telegram_app = build_telegram_application()
         requested_mode = TELEGRAM_MODE if TELEGRAM_MODE in ("webhook", "polling") else "webhook"
+        logger.info(
+            "Telegram runtime requested_mode=%s webhook_base_url=%s",
+            requested_mode,
+            WEBHOOK_BASE_URL or "<missing>",
+        )
 
         if requested_mode == "webhook":
             webhook_url = _build_webhook_url()
@@ -1223,7 +1239,7 @@ if _should_autostart_on_import():
 if __name__ == "__main__":
     if TELEGRAM_MODE == "webhook":
         # Local webhook mode: keep Flask in foreground and telegram runtime in background.
-        ensure_bot_started_in_background()
+        run_telegram_bot()
         run()
     else:
         # Local polling mode: keep polling loop in foreground and Flask health server in background.
