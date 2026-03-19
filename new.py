@@ -120,7 +120,7 @@ MAIN_CHANNEL_ID = os.environ.get("MAIN_CHANNEL_ID", "-1003104322226")
 PASSWORD = os.environ.get("UPLOAD_PASSWORD", "test")
 PASSWORD_VALID_SECONDS = int(os.environ.get("PASSWORD_VALID_SECONDS", 24 * 3600))
 DB_PATH = os.environ.get("DB_PATH", "tgBotdb.db")
-DB_BACKUP_PATH = os.environ.get("DB_BACKUP_PATH", "tgBotdb.db").strip()
+DB_BACKUP_PATH = os.environ.get("DB_BACKUP_PATH", "").strip()
 ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "6233731222").split(",") if x.strip().isdigit()]
 OWNER_ID = ADMIN_IDS[0] if ADMIN_IDS else None
 
@@ -185,29 +185,18 @@ def _resolve_existing_db_path() -> None:
         except Exception:
             return -1
 
-    # If backup DB exists and current DB is missing, use backup immediately.
-    if DB_BACKUP_PATH and os.path.exists(DB_BACKUP_PATH) and not os.path.exists(DB_PATH):
-        logger.warning("DB_PATH '%s' not found; using backup DB '%s'.", DB_PATH, DB_BACKUP_PATH)
-        DB_PATH = DB_BACKUP_PATH
-        return
-
-    # If both exist but current DB has no content while backup has content, prefer backup.
+    # Optional backup path is only used as a one-time seed source by init_db.
     if DB_BACKUP_PATH and os.path.exists(DB_BACKUP_PATH) and os.path.exists(DB_PATH):
         current_rows = _content_rows(DB_PATH)
         backup_rows = _content_rows(DB_BACKUP_PATH)
-        if (
-            os.path.abspath(DB_PATH) != os.path.abspath(DB_BACKUP_PATH)
-            and current_rows == 0
-            and backup_rows > 0
-        ):
-            logger.warning(
-                "Current DB '%s' has no content rows; switching to backup DB '%s' (%s rows).",
+        if current_rows >= 0 and backup_rows >= 0:
+            logger.info(
+                "DB row check current='%s' rows=%s backup='%s' rows=%s",
                 DB_PATH,
+                current_rows,
                 DB_BACKUP_PATH,
                 backup_rows,
             )
-            DB_PATH = DB_BACKUP_PATH
-            return
 
     if os.path.exists(DB_PATH):
         return
@@ -240,6 +229,31 @@ def _copy_existing_db_to_path(src: str, dst: str) -> None:
     except Exception:
         logger.exception("Failed to copy DB file from %s to %s", src_abs, dst_abs)
 
+def _seed_source_db_path() -> Optional[str]:
+    source = os.path.abspath(DB_PATH)
+    if os.path.exists(source):
+        return source
+    if DB_BACKUP_PATH:
+        backup = os.path.abspath(DB_BACKUP_PATH)
+        if os.path.exists(backup):
+            logger.warning(
+                "Primary DB file not found (%s). Using backup file as seed source: %s",
+                source,
+                backup,
+            )
+            return backup
+    return None
+
+def _content_count_for_log(path: str) -> int:
+    try:
+        with sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True) as conn:
+            c = conn.cursor()
+            c.execute("SELECT COUNT(1) FROM content")
+            row = c.fetchone()
+            return int(row[0] if row and row[0] is not None else 0)
+    except Exception:
+        return -1
+
 def _is_db_dir_writable(path: str) -> bool:
     abs_path = os.path.abspath(path)
     dir_path = os.path.dirname(abs_path) or "."
@@ -256,20 +270,55 @@ def _is_db_dir_writable(path: str) -> bool:
     except Exception:
         return False
 
+def _candidate_fallback_dirs() -> List[str]:
+    candidates: List[str] = []
+    explicit = os.environ.get("DB_FALLBACK_DIR", "").strip()
+    if explicit:
+        candidates.append(explicit)
+    for key in ("LEAPCELL_DATA_DIR", "LEAPCELL_VOLUME_DIR", "PERSISTENT_DATA_DIR"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            candidates.append(value)
+    candidates.extend(
+        [
+            "/data",
+            "/workspace/data",
+            "/workspace",
+            os.path.join(os.path.abspath("."), "data"),
+            os.path.join(os.path.expanduser("~"), "data"),
+            "/tmp",
+        ]
+    )
+    deduped: List[str] = []
+    seen = set()
+    for item in candidates:
+        if item and item not in seen:
+            seen.add(item)
+            deduped.append(item)
+    return deduped
+
+def _pick_writable_fallback_path(base_name: str) -> Optional[str]:
+    for directory in _candidate_fallback_dirs():
+        candidate = os.path.join(directory, base_name)
+        if _is_db_dir_writable(candidate):
+            return candidate
+    return None
+
 def _ensure_writable_db_path() -> None:
     global DB_PATH
     if _is_db_dir_writable(DB_PATH):
         return
-    source_path = DB_PATH
+    source_path = _seed_source_db_path() or DB_PATH
     base_name = os.path.basename(DB_PATH) or "tg_content.db"
-    fallback_dir = os.environ.get("DB_FALLBACK_DIR", "/tmp").strip() or "/tmp"
-    fallback_path = os.path.join(fallback_dir, base_name)
-    if not _is_db_dir_writable(fallback_path):
+    fallback_path = _pick_writable_fallback_path(base_name)
+    if not fallback_path:
         raise RuntimeError(
-            f"DB path is not writable: {DB_PATH}. Fallback is also not writable: {fallback_path}"
+            f"DB path is not writable: {DB_PATH}. No writable fallback directory found."
         )
     if os.path.abspath(source_path) != os.path.abspath(fallback_path) and not os.path.exists(fallback_path):
         _copy_existing_db_to_path(source_path, fallback_path)
+    if os.path.abspath(fallback_path).startswith("/tmp"):
+        logger.warning("Using /tmp for database fallback. Data may be lost after restart: %s", fallback_path)
     logger.warning("DB path %s is read-only. Using writable fallback DB path: %s", DB_PATH, fallback_path)
     DB_PATH = fallback_path
 
@@ -371,6 +420,11 @@ def init_db() -> None:
         c.execute("PRAGMA synchronous=NORMAL")
         _apply_db_schema(conn)
         conn.commit()
+        logger.info(
+            "SQLite initialized at %s (content rows=%s)",
+            os.path.abspath(DB_PATH),
+            _content_count_for_log(DB_PATH),
+        )
         conn.close()
         return
     except sqlite3.OperationalError as e:
@@ -380,8 +434,11 @@ def init_db() -> None:
             raise
         old_path = DB_PATH
         base_name = os.path.basename(DB_PATH) or "tg_content.db"
-        fallback_dir = os.environ.get("DB_FALLBACK_DIR", "/tmp").strip() or "/tmp"
-        fallback_path = os.path.join(fallback_dir, base_name)
+        fallback_path = _pick_writable_fallback_path(base_name)
+        if not fallback_path:
+            raise RuntimeError(
+                f"SQLite DB path appears read-only ({old_path}) and no writable fallback directory was found."
+            ) from e
         if old_path != fallback_path:
             logger.warning(
                 "SQLite DB path appears read-only (%s). Retrying with fallback path: %s",
