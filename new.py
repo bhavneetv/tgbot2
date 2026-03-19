@@ -397,7 +397,61 @@ def init_postgres_content_db() -> None:
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users(
+                user_id BIGINT PRIMARY KEY,
+                last_auth BIGINT,
+                is_vip INTEGER DEFAULT 0,
+                vip_name TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tokens(
+                token TEXT PRIMARY KEY,
+                user_id BIGINT,
+                issued_at BIGINT,
+                expires_at BIGINT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shortener_requests(
+                id BIGSERIAL PRIMARY KEY,
+                shortener_url TEXT,
+                token TEXT,
+                status TEXT,
+                created_at BIGINT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings(
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS saved_thumbnails(
+                thumb_id BIGSERIAL PRIMARY KEY,
+                owner_id BIGINT,
+                thumb_file_id TEXT NOT NULL,
+                name TEXT NOT NULL UNIQUE,
+                created_at BIGINT
+            )
+            """
+        )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_pg_media_items_content_id ON media_items(content_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pg_users_is_vip ON users(is_vip)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pg_tokens_user_expires ON tokens(user_id, expires_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pg_tokens_expires ON tokens(expires_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pg_shortener_requests_token ON shortener_requests(token)")
         cur.execute(
             """
             SELECT setval(
@@ -456,16 +510,26 @@ def migrate_sqlite_new_content_to_postgres() -> None:
             (POSTGRES_MIN_CONTENT_ID,),
         )
         content_rows = s.fetchall()
-        if not content_rows:
-            sq.close()
-            return
         ids = [int(row[0]) for row in content_rows]
-        placeholders = ",".join("?" for _ in ids)
-        s.execute(
-            f"SELECT media_id, content_id, file_id, file_unique_id, media_type, is_forwarded FROM media_items WHERE content_id IN ({placeholders})",
-            ids,
-        )
-        media_rows = s.fetchall()
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            s.execute(
+                f"SELECT media_id, content_id, file_id, file_unique_id, media_type, is_forwarded FROM media_items WHERE content_id IN ({placeholders})",
+                ids,
+            )
+            media_rows = s.fetchall()
+        else:
+            media_rows = []
+        s.execute("SELECT user_id, last_auth, is_vip, vip_name FROM users")
+        user_rows = s.fetchall()
+        s.execute("SELECT key, value FROM settings")
+        setting_rows = s.fetchall()
+        s.execute("SELECT token, user_id, issued_at, expires_at FROM tokens")
+        token_rows = s.fetchall()
+        s.execute("SELECT thumb_id, owner_id, thumb_file_id, name, created_at FROM saved_thumbnails")
+        thumb_rows = s.fetchall()
+        s.execute("SELECT id, shortener_url, token, status, created_at FROM shortener_requests")
+        short_rows = s.fetchall()
         sq.close()
 
         pg = _pg_connect()
@@ -488,6 +552,60 @@ def migrate_sqlite_new_content_to_postgres() -> None:
                 """,
                 row,
             )
+        for row in user_rows:
+            p.execute(
+                """
+                INSERT INTO users(user_id, last_auth, is_vip, vip_name)
+                VALUES(%s,%s,%s,%s)
+                ON CONFLICT (user_id) DO UPDATE
+                SET last_auth = EXCLUDED.last_auth,
+                    is_vip = EXCLUDED.is_vip,
+                    vip_name = EXCLUDED.vip_name
+                """,
+                row,
+            )
+        for row in setting_rows:
+            p.execute(
+                """
+                INSERT INTO settings(key, value) VALUES(%s,%s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """,
+                row,
+            )
+        for row in token_rows:
+            p.execute(
+                """
+                INSERT INTO tokens(token, user_id, issued_at, expires_at)
+                VALUES(%s,%s,%s,%s)
+                ON CONFLICT (token) DO UPDATE
+                SET user_id = EXCLUDED.user_id,
+                    issued_at = EXCLUDED.issued_at,
+                    expires_at = EXCLUDED.expires_at
+                """,
+                row,
+            )
+        for row in thumb_rows:
+            p.execute(
+                """
+                INSERT INTO saved_thumbnails(thumb_id, owner_id, thumb_file_id, name, created_at)
+                VALUES(%s,%s,%s,%s,%s)
+                ON CONFLICT (thumb_id) DO UPDATE
+                SET owner_id = EXCLUDED.owner_id,
+                    thumb_file_id = EXCLUDED.thumb_file_id,
+                    name = EXCLUDED.name,
+                    created_at = EXCLUDED.created_at
+                """,
+                row,
+            )
+        for row in short_rows:
+            p.execute(
+                """
+                INSERT INTO shortener_requests(id, shortener_url, token, status, created_at)
+                VALUES(%s,%s,%s,%s,%s)
+                ON CONFLICT (id) DO NOTHING
+                """,
+                row,
+            )
         p.execute(
             """
             SELECT setval(
@@ -506,6 +624,24 @@ def migrate_sqlite_new_content_to_postgres() -> None:
             SELECT setval(
                 pg_get_serial_sequence('media_items', 'media_id'),
                 GREATEST(COALESCE((SELECT MAX(media_id) FROM media_items), 1), 1),
+                true
+            )
+            """
+        )
+        p.execute(
+            """
+            SELECT setval(
+                pg_get_serial_sequence('saved_thumbnails', 'thumb_id'),
+                GREATEST(COALESCE((SELECT MAX(thumb_id) FROM saved_thumbnails), 1), 1),
+                true
+            )
+            """
+        )
+        p.execute(
+            """
+            SELECT setval(
+                pg_get_serial_sequence('shortener_requests', 'id'),
+                GREATEST(COALESCE((SELECT MAX(id) FROM shortener_requests), 1), 1),
                 true
             )
             """
@@ -665,15 +801,26 @@ def init_db() -> None:
     conn.commit()
     conn.close()
 
+def _state_in_postgres() -> bool:
+    return _pg_content_ready
+
 def load_password_from_db():
     """Load password from DB into global PASSWORD variable (if present)."""
     global PASSWORD
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT value FROM settings WHERE key = 'password'")
-        row = c.fetchone()
-        conn.close()
+        if _state_in_postgres():
+            conn = _pg_connect()
+            c = conn.cursor()
+            c.execute("SELECT value FROM settings WHERE key = %s", ("password",))
+            row = c.fetchone()
+            c.close()
+            conn.close()
+        else:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT value FROM settings WHERE key = 'password'")
+            row = c.fetchone()
+            conn.close()
         if row and row[0]:
             PASSWORD = row[0]
             logger.info("Loaded PASSWORD from settings table.")
@@ -682,11 +829,25 @@ def load_password_from_db():
         logger.exception("Failed to read password from DB; using default/env password.")
     # If not present, initialize settings value to current PASSWORD
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", ("password", PASSWORD))
-        conn.commit()
-        conn.close()
+        if _state_in_postgres():
+            conn = _pg_connect()
+            c = conn.cursor()
+            c.execute(
+                """
+                INSERT INTO settings(key,value) VALUES(%s,%s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """,
+                ("password", PASSWORD),
+            )
+            conn.commit()
+            c.close()
+            conn.close()
+        else:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", ("password", PASSWORD))
+            conn.commit()
+            conn.close()
     except Exception:
         logger.exception("Failed to initialize password in DB.")
 
@@ -694,11 +855,19 @@ def load_protection_from_db():
     """Load protect_content setting into runtime global."""
     global content_protection
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT value FROM settings WHERE key = 'protect_content'")
-        row = c.fetchone()
-        conn.close()
+        if _state_in_postgres():
+            conn = _pg_connect()
+            c = conn.cursor()
+            c.execute("SELECT value FROM settings WHERE key = %s", ("protect_content",))
+            row = c.fetchone()
+            c.close()
+            conn.close()
+        else:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT value FROM settings WHERE key = 'protect_content'")
+            row = c.fetchone()
+            conn.close()
         if row and row[0] is not None:
             content_protection = True if row[0] == "1" else False
             logger.info("Loaded protect_content=%s from settings.", content_protection)
@@ -707,39 +876,89 @@ def load_protection_from_db():
         logger.exception("Failed to read protect_content from DB; using default True.")
     # default: ensure a record exists
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", ("protect_content", "1" if content_protection else "0"))
-        conn.commit()
-        conn.close()
+        if _state_in_postgres():
+            conn = _pg_connect()
+            c = conn.cursor()
+            c.execute(
+                """
+                INSERT INTO settings(key,value) VALUES(%s,%s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """,
+                ("protect_content", "1" if content_protection else "0"),
+            )
+            conn.commit()
+            c.close()
+            conn.close()
+        else:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", ("protect_content", "1" if content_protection else "0"))
+            conn.commit()
+            conn.close()
     except Exception:
         logger.exception("Failed to initialize protect_content in DB.")
 
 def set_protection_in_db(value: bool):
     global content_protection
     content_protection = bool(value)
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", ("protect_content", "1" if content_protection else "0"))
-    conn.commit()
-    conn.close()
+    if _state_in_postgres():
+        conn = _pg_connect()
+        c = conn.cursor()
+        c.execute(
+            """
+            INSERT INTO settings(key,value) VALUES(%s,%s)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """,
+            ("protect_content", "1" if content_protection else "0"),
+        )
+        conn.commit()
+        c.close()
+        conn.close()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", ("protect_content", "1" if content_protection else "0"))
+        conn.commit()
+        conn.close()
 
 def set_password_in_db(new_pass: str):
     """Persist password in DB and update runtime global."""
     global PASSWORD
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", ("password", new_pass))
-    conn.commit()
-    conn.close()
+    if _state_in_postgres():
+        conn = _pg_connect()
+        c = conn.cursor()
+        c.execute(
+            """
+            INSERT INTO settings(key,value) VALUES(%s,%s)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """,
+            ("password", new_pass),
+        )
+        conn.commit()
+        c.close()
+        conn.close()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", ("password", new_pass))
+        conn.commit()
+        conn.close()
     PASSWORD = new_pass
 
 def user_is_authed(user_id: int) -> bool:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT last_auth, is_vip FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
+    if _state_in_postgres():
+        conn = _pg_connect()
+        c = conn.cursor()
+        c.execute("SELECT last_auth, is_vip FROM users WHERE user_id = %s", (user_id,))
+        row = c.fetchone()
+        c.close()
+        conn.close()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT last_auth, is_vip FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        conn.close()
     if not row:
         return False
     last_auth, is_vip = row
@@ -750,10 +969,30 @@ def user_is_authed(user_id: int) -> bool:
     return (time.time() - last_auth) <= PASSWORD_VALID_SECONDS
 
 def set_user_auth(user_id: int):
+    now = int(time.time())
+    if _state_in_postgres():
+        conn = _pg_connect()
+        c = conn.cursor()
+        c.execute("SELECT is_vip, vip_name FROM users WHERE user_id = %s", (user_id,))
+        row = c.fetchone()
+        is_vip = row[0] if row else 0
+        vip_name = row[1] if row else None
+        c.execute(
+            """
+            INSERT INTO users(user_id,last_auth,is_vip,vip_name) VALUES(%s,%s,%s,%s)
+            ON CONFLICT (user_id) DO UPDATE
+            SET last_auth = EXCLUDED.last_auth,
+                is_vip = EXCLUDED.is_vip,
+                vip_name = EXCLUDED.vip_name
+            """,
+            (user_id, now, is_vip, vip_name),
+        )
+        conn.commit()
+        c.close()
+        conn.close()
+        return
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    now = int(time.time())
-    # preserve VIP fields if present
     c.execute("SELECT is_vip, vip_name FROM users WHERE user_id = ?", (user_id,))
     row = c.fetchone()
     is_vip = row[0] if row else 0
@@ -766,9 +1005,33 @@ def set_user_auth(user_id: int):
     conn.close()
 
 def set_user_vip(user_id: int, is_vip: int = 1, vip_name: Optional[str] = None):
+    if _state_in_postgres():
+        conn = _pg_connect()
+        c = conn.cursor()
+        c.execute("SELECT last_auth, vip_name FROM users WHERE user_id = %s", (user_id,))
+        row = c.fetchone()
+        last_auth = row[0] if row else 0
+        existing_name = row[1] if row else None
+        if is_vip:
+            resolved_name = (vip_name or existing_name or "").strip() or None
+        else:
+            resolved_name = None
+        c.execute(
+            """
+            INSERT INTO users(user_id,last_auth,is_vip,vip_name) VALUES(%s,%s,%s,%s)
+            ON CONFLICT (user_id) DO UPDATE
+            SET last_auth = EXCLUDED.last_auth,
+                is_vip = EXCLUDED.is_vip,
+                vip_name = EXCLUDED.vip_name
+            """,
+            (user_id, last_auth, is_vip, resolved_name),
+        )
+        conn.commit()
+        c.close()
+        conn.close()
+        return
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # preserve last_auth and name if present
     c.execute("SELECT last_auth, vip_name FROM users WHERE user_id = ?", (user_id,))
     row = c.fetchone()
     last_auth = row[0] if row else 0
@@ -785,22 +1048,56 @@ def set_user_vip(user_id: int, is_vip: int = 1, vip_name: Optional[str] = None):
     conn.close()
 
 def list_vips(include_owner: bool = True) -> List[Dict[str, Any]]:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    if include_owner or OWNER_ID is None:
-        c.execute(
-            "SELECT user_id, COALESCE(vip_name, '') FROM users WHERE is_vip = 1 ORDER BY user_id ASC"
-        )
+    if _state_in_postgres():
+        conn = _pg_connect()
+        c = conn.cursor()
+        if include_owner or OWNER_ID is None:
+            c.execute(
+                "SELECT user_id, COALESCE(vip_name, '') FROM users WHERE is_vip = 1 ORDER BY user_id ASC"
+            )
+        else:
+            c.execute(
+                "SELECT user_id, COALESCE(vip_name, '') FROM users WHERE is_vip = 1 AND user_id != %s ORDER BY user_id ASC",
+                (OWNER_ID,),
+            )
+        rows = c.fetchall()
+        c.close()
+        conn.close()
     else:
-        c.execute(
-            "SELECT user_id, COALESCE(vip_name, '') FROM users WHERE is_vip = 1 AND user_id != ? ORDER BY user_id ASC",
-            (OWNER_ID,),
-        )
-    rows = c.fetchall()
-    conn.close()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        if include_owner or OWNER_ID is None:
+            c.execute(
+                "SELECT user_id, COALESCE(vip_name, '') FROM users WHERE is_vip = 1 ORDER BY user_id ASC"
+            )
+        else:
+            c.execute(
+                "SELECT user_id, COALESCE(vip_name, '') FROM users WHERE is_vip = 1 AND user_id != ? ORDER BY user_id ASC",
+                (OWNER_ID,),
+            )
+        rows = c.fetchall()
+        conn.close()
     return [{"user_id": row[0], "vip_name": (row[1] or "").strip()} for row in rows]
 
 def remove_all_vips_except_owner() -> int:
+    if _state_in_postgres():
+        conn = _pg_connect()
+        c = conn.cursor()
+        if OWNER_ID is None:
+            c.execute("SELECT COUNT(1) FROM users WHERE is_vip = 1")
+            removed_count = c.fetchone()[0]
+            c.execute("UPDATE users SET is_vip = 0, vip_name = NULL WHERE is_vip = 1")
+        else:
+            c.execute("SELECT COUNT(1) FROM users WHERE is_vip = 1 AND user_id != %s", (OWNER_ID,))
+            removed_count = c.fetchone()[0]
+            c.execute(
+                "UPDATE users SET is_vip = 0, vip_name = NULL WHERE is_vip = 1 AND user_id != %s",
+                (OWNER_ID,),
+            )
+        conn.commit()
+        c.close()
+        conn.close()
+        return removed_count
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     if OWNER_ID is None:
@@ -818,11 +1115,68 @@ def remove_all_vips_except_owner() -> int:
     conn.close()
     return removed_count
 
-def save_named_thumbnail(owner_id: int, thumb_file_id: str, name: str) -> Dict[str, Any]:
+def get_user_vip_status(user_id: int) -> bool:
+    if _state_in_postgres():
+        conn = _pg_connect()
+        c = conn.cursor()
+        c.execute("SELECT is_vip FROM users WHERE user_id = %s", (user_id,))
+        row = c.fetchone()
+        c.close()
+        conn.close()
+        return bool(row[0]) if row else False
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    c.execute("SELECT is_vip FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return bool(row[0]) if row else False
+
+def get_user_auth_and_vip(user_id: int) -> Optional[Dict[str, Any]]:
+    if _state_in_postgres():
+        conn = _pg_connect()
+        c = conn.cursor()
+        c.execute("SELECT last_auth, is_vip, COALESCE(vip_name, '') FROM users WHERE user_id = %s", (user_id,))
+        row = c.fetchone()
+        c.close()
+        conn.close()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT last_auth, is_vip, COALESCE(vip_name, '') FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        conn.close()
+    if not row:
+        return None
+    return {"last_auth": row[0], "is_vip": bool(row[1]), "vip_name": (row[2] or "").strip()}
+
+def save_named_thumbnail(owner_id: int, thumb_file_id: str, name: str) -> Dict[str, Any]:
     clean_name = name.strip()
     now = int(time.time())
+    if _state_in_postgres():
+        conn = _pg_connect()
+        c = conn.cursor()
+        c.execute("SELECT thumb_id FROM saved_thumbnails WHERE name = %s", (clean_name,))
+        row = c.fetchone()
+        if row:
+            thumb_id = row[0]
+            c.execute(
+                "UPDATE saved_thumbnails SET owner_id = %s, thumb_file_id = %s, created_at = %s WHERE thumb_id = %s",
+                (owner_id, thumb_file_id, now, thumb_id),
+            )
+            created = False
+        else:
+            c.execute(
+                "INSERT INTO saved_thumbnails(owner_id, thumb_file_id, name, created_at) VALUES(%s,%s,%s,%s) RETURNING thumb_id",
+                (owner_id, thumb_file_id, clean_name, now),
+            )
+            thumb_id = c.fetchone()[0]
+            created = True
+        conn.commit()
+        c.close()
+        conn.close()
+        return {"thumb_id": int(thumb_id), "created": created}
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
     c.execute("SELECT thumb_id FROM saved_thumbnails WHERE name = ?", (clean_name,))
     row = c.fetchone()
     if row:
@@ -844,27 +1198,48 @@ def save_named_thumbnail(owner_id: int, thumb_file_id: str, name: str) -> Dict[s
     return {"thumb_id": thumb_id, "created": created}
 
 def list_saved_thumbnails() -> List[Dict[str, Any]]:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "SELECT thumb_id, owner_id, thumb_file_id, name FROM saved_thumbnails ORDER BY name COLLATE NOCASE ASC"
-    )
-    rows = c.fetchall()
-    conn.close()
+    if _state_in_postgres():
+        conn = _pg_connect()
+        c = conn.cursor()
+        c.execute(
+            "SELECT thumb_id, owner_id, thumb_file_id, name FROM saved_thumbnails ORDER BY name ASC"
+        )
+        rows = c.fetchall()
+        c.close()
+        conn.close()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "SELECT thumb_id, owner_id, thumb_file_id, name FROM saved_thumbnails ORDER BY name COLLATE NOCASE ASC"
+        )
+        rows = c.fetchall()
+        conn.close()
     return [
         {"thumb_id": row[0], "owner_id": row[1], "thumb_file_id": row[2], "name": row[3]}
         for row in rows
     ]
 
 def get_saved_thumbnail(thumb_id: int) -> Optional[Dict[str, Any]]:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "SELECT thumb_id, owner_id, thumb_file_id, name FROM saved_thumbnails WHERE thumb_id = ?",
-        (thumb_id,),
-    )
-    row = c.fetchone()
-    conn.close()
+    if _state_in_postgres():
+        conn = _pg_connect()
+        c = conn.cursor()
+        c.execute(
+            "SELECT thumb_id, owner_id, thumb_file_id, name FROM saved_thumbnails WHERE thumb_id = %s",
+            (thumb_id,),
+        )
+        row = c.fetchone()
+        c.close()
+        conn.close()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "SELECT thumb_id, owner_id, thumb_file_id, name FROM saved_thumbnails WHERE thumb_id = ?",
+            (thumb_id,),
+        )
+        row = c.fetchone()
+        conn.close()
     if not row:
         return None
     return {"thumb_id": row[0], "owner_id": row[1], "thumb_file_id": row[2], "name": row[3]}
@@ -1026,6 +1401,8 @@ def update_content_description(content_id: int, description: str) -> None:
             logger.exception("Failed to update description in PostgreSQL for content_id=%s.", content_id)
             if STRICT_POSTGRES_CONTENT:
                 raise
+        if STRICT_POSTGRES_CONTENT:
+            raise RuntimeError(f"content_id={content_id} not found in PostgreSQL while updating description.")
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("UPDATE content SET description = ? WHERE content_id = ?", (description, content_id))
@@ -1050,6 +1427,8 @@ def update_main_channel_message_id(content_id: int, message_id: int) -> None:
             logger.exception("Failed to update main_channel_message_id in PostgreSQL for content_id=%s.", content_id)
             if STRICT_POSTGRES_CONTENT:
                 raise
+        if STRICT_POSTGRES_CONTENT:
+            raise RuntimeError(f"content_id={content_id} not found in PostgreSQL while updating main_channel_message_id.")
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("UPDATE content SET main_channel_message_id = ? WHERE content_id = ?", (message_id, content_id))
@@ -1058,19 +1437,35 @@ def update_main_channel_message_id(content_id: int, message_id: int) -> None:
 
 # ----------------- Token helpers -----------------
 def token_exists_in_tokens(token: str) -> bool:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM tokens WHERE token = ? LIMIT 1", (token,))
-    row = c.fetchone()
-    conn.close()
+    if _state_in_postgres():
+        conn = _pg_connect()
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM tokens WHERE token = %s LIMIT 1", (token,))
+        row = c.fetchone()
+        c.close()
+        conn.close()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM tokens WHERE token = ? LIMIT 1", (token,))
+        row = c.fetchone()
+        conn.close()
     return bool(row)
 
 def token_exists_in_shortener(token: str) -> bool:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM shortener_requests WHERE token = ? LIMIT 1", (token,))
-    row = c.fetchone()
-    conn.close()
+    if _state_in_postgres():
+        conn = _pg_connect()
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM shortener_requests WHERE token = %s LIMIT 1", (token,))
+        row = c.fetchone()
+        c.close()
+        conn.close()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM shortener_requests WHERE token = ? LIMIT 1", (token,))
+        row = c.fetchone()
+        conn.close()
     return bool(row)
 
 def generate_token_value(length_bytes: int = 4) -> str:
@@ -1090,23 +1485,38 @@ def activate_token_for_user(token: str, user_id: int) -> bool:
     now = int(time.time())
     expires = now + TOKEN_VALID_SECONDS
     try:
+        if _state_in_postgres():
+            conn = _pg_connect()
+            c = conn.cursor()
+            c.execute("SELECT expires_at FROM tokens WHERE token = %s", (token,))
+            row = c.fetchone()
+            if row:
+                if row[0] >= now:
+                    c.close()
+                    conn.close()
+                    return True
+                c.execute("UPDATE tokens SET user_id=%s, issued_at=%s, expires_at=%s WHERE token=%s", (user_id, now, expires, token))
+                conn.commit()
+                c.close()
+                conn.close()
+                return True
+            c.execute("INSERT INTO tokens(token,user_id,issued_at,expires_at) VALUES(%s,%s,%s,%s)", (token, user_id, now, expires))
+            conn.commit()
+            c.close()
+            conn.close()
+            return True
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        # if the token already exists in tokens table and not expired, do not override (but normally tokens are only created now)
         c.execute("SELECT expires_at FROM tokens WHERE token = ?", (token,))
         row = c.fetchone()
         if row:
-            # if expired, we can re-activate for this user; otherwise keep existing
             if row[0] >= now:
                 conn.close()
-                return True  # already active
-            else:
-                # overwrite expired token
-                c.execute("UPDATE tokens SET user_id=?, issued_at=?, expires_at=? WHERE token=?", (user_id, now, expires, token))
-                conn.commit()
-                conn.close()
                 return True
-        # create new token record
+            c.execute("UPDATE tokens SET user_id=?, issued_at=?, expires_at=? WHERE token=?", (user_id, now, expires, token))
+            conn.commit()
+            conn.close()
+            return True
         c.execute("INSERT INTO tokens(token,user_id,issued_at,expires_at) VALUES(?,?,?,?)", (token, user_id, now, expires))
         conn.commit()
         conn.close()
@@ -1118,11 +1528,22 @@ def activate_token_for_user(token: str, user_id: int) -> bool:
 def get_active_token_for_user(user_id: int) -> Optional[Dict[str, Any]]:
     """Return a valid (not expired) token record for the user if exists, else None."""
     now = int(time.time())
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT token,issued_at,expires_at FROM tokens WHERE user_id = ? AND expires_at >= ? ORDER BY issued_at DESC LIMIT 1", (user_id, now))
-    row = c.fetchone()
-    conn.close()
+    if _state_in_postgres():
+        conn = _pg_connect()
+        c = conn.cursor()
+        c.execute(
+            "SELECT token,issued_at,expires_at FROM tokens WHERE user_id = %s AND expires_at >= %s ORDER BY issued_at DESC LIMIT 1",
+            (user_id, now),
+        )
+        row = c.fetchone()
+        c.close()
+        conn.close()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT token,issued_at,expires_at FROM tokens WHERE user_id = ? AND expires_at >= ? ORDER BY issued_at DESC LIMIT 1", (user_id, now))
+        row = c.fetchone()
+        conn.close()
     if not row:
         return None
     return {"token": row[0], "issued_at": row[1], "expires_at": row[2]}
@@ -1130,19 +1551,38 @@ def get_active_token_for_user(user_id: int) -> Optional[Dict[str, Any]]:
 def cleanup_expired_tokens():
     """Optionally delete expired tokens to keep DB clean."""
     now = int(time.time())
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("DELETE FROM tokens WHERE expires_at < ?", (now,))
-    conn.commit()
-    conn.close()
+    if _state_in_postgres():
+        conn = _pg_connect()
+        c = conn.cursor()
+        c.execute("DELETE FROM tokens WHERE expires_at < %s", (now,))
+        conn.commit()
+        c.close()
+        conn.close()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("DELETE FROM tokens WHERE expires_at < ?", (now,))
+        conn.commit()
+        conn.close()
 
 def record_shortener_request(short_url: str, token: str, status: str = "created"):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
     now = int(time.time())
-    c.execute("INSERT INTO shortener_requests(shortener_url, token, status, created_at) VALUES(?,?,?,?)", (short_url, token, status, now))
-    conn.commit()
-    conn.close()
+    if _state_in_postgres():
+        conn = _pg_connect()
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO shortener_requests(shortener_url, token, status, created_at) VALUES(%s,%s,%s,%s)",
+            (short_url, token, status, now),
+        )
+        conn.commit()
+        c.close()
+        conn.close()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT INTO shortener_requests(shortener_url, token, status, created_at) VALUES(?,?,?,?)", (short_url, token, status, now))
+        conn.commit()
+        conn.close()
 
 # ----------------- Helper utils -----------------
 def count_media_for_session(session: Dict[str, Any]) -> Dict[str, int]:
@@ -1246,13 +1686,7 @@ async def handle_view_content(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.effective_chat.send_message("Content not found.")
         return
     requires_token = bool(content.get("requires_token"))
-    # check VIP
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT is_vip FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    is_vip = bool(row[0]) if row else False
-    conn.close()
+    is_vip = get_user_vip_status(user_id)
 
     # If not required or VIP -> show
     if (not requires_token) or is_vip:
@@ -1413,13 +1847,7 @@ async def thumbnail_choice_pressed(update: Update, context: ContextTypes.DEFAULT
 # --- Upload flow (mostly preserved) ---
 async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    # VIP skip password
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT is_vip FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    is_vip = bool(row[0]) if row else False
-    conn.close()
+    is_vip = get_user_vip_status(user_id)
 
     if is_vip:
         sessions[user_id] = {"uploader_id": user_id, "media_list": []}
@@ -1878,18 +2306,14 @@ async def delvip_input_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Owner VIP cannot be removed. Send another ID, or 'cancel'.")
         return
 
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT is_vip, COALESCE(vip_name, '') FROM users WHERE user_id = ?", (uid,))
-    row = c.fetchone()
-    conn.close()
-    if not row or not row[0]:
+    info = get_user_auth_and_vip(uid)
+    if not info or not info["is_vip"]:
         await update.message.reply_text("That user is not a VIP. Send another ID, or 'cancel'.")
         return
 
     set_user_vip(uid, 0)
     context.user_data.pop("awaiting_delvip_id", None)
-    await update.message.reply_text(f"Removed VIP: {row[1] or 'No name'} ({uid})")
+    await update.message.reply_text(f"Removed VIP: {info.get('vip_name') or 'No name'} ({uid})")
 
 # New /changepass admin command
 async def cmd_changepass(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1963,15 +2387,11 @@ async def cmd_protection(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Pretty /myinfo (emoji)
 async def cmd_myinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT last_auth,is_vip FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    if not row:
+    info = get_user_auth_and_vip(user_id)
+    if not info:
         await update.message.reply_text("❌ You are not authenticated and not a VIP. Use /upload to start and provide password.")
         return
-    last_auth, is_vip = row
+    last_auth, is_vip = info["last_auth"], info["is_vip"]
     if is_vip:
         await update.message.reply_text("🌟 You are a VIP user. You can upload and view token-protected content without tokens.")
         return
