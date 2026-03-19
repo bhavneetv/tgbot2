@@ -138,6 +138,7 @@ TELEGRAM_READ_TIMEOUT_SECONDS = float(os.environ.get("TELEGRAM_READ_TIMEOUT_SECO
 TELEGRAM_WRITE_TIMEOUT_SECONDS = float(os.environ.get("TELEGRAM_WRITE_TIMEOUT_SECONDS", "30"))
 TELEGRAM_POOL_TIMEOUT_SECONDS = float(os.environ.get("TELEGRAM_POOL_TIMEOUT_SECONDS", "15"))
 TELEGRAM_CONNECTION_POOL_SIZE = int(os.environ.get("TELEGRAM_CONNECTION_POOL_SIZE", "32"))
+ALLOW_TMP_DB_FALLBACK = os.environ.get("ALLOW_TMP_DB_FALLBACK", "0").strip().lower() in ("1", "true", "yes")
 
 # default runtime flag; actual value loaded from DB settings at startup
 content_protection = True
@@ -317,7 +318,14 @@ def _ensure_writable_db_path() -> None:
         )
     if os.path.abspath(source_path) != os.path.abspath(fallback_path) and not os.path.exists(fallback_path):
         _copy_existing_db_to_path(source_path, fallback_path)
-    if os.path.abspath(fallback_path).startswith("/tmp"):
+    fallback_abs = os.path.abspath(fallback_path)
+    if fallback_abs.startswith("/tmp"):
+        if not ALLOW_TMP_DB_FALLBACK:
+            raise RuntimeError(
+                "No persistent writable DB path found. Refusing to use /tmp because data would disappear on restart. "
+                "Set DB_PATH/DB_FALLBACK_DIR to a persistent writable location or use Leapcell Persistent Server. "
+                "If you still want ephemeral storage, set ALLOW_TMP_DB_FALLBACK=1."
+            )
         logger.warning("Using /tmp for database fallback. Data may be lost after restart: %s", fallback_path)
     logger.warning("DB path %s is read-only. Using writable fallback DB path: %s", DB_PATH, fallback_path)
     DB_PATH = fallback_path
