@@ -403,19 +403,19 @@ def init_postgres_content_db() -> None:
             SELECT setval(
                 pg_get_serial_sequence('content', 'content_id'),
                 GREATEST(
-                    COALESCE((SELECT MAX(content_id) FROM content), 0),
+                    COALESCE((SELECT MAX(content_id) FROM content), 1),
                     %s
                 ),
                 true
             )
             """,
-            (POSTGRES_MIN_CONTENT_ID - 1,),
+            (max(POSTGRES_MIN_CONTENT_ID - 1, 1),),
         )
         cur.execute(
             """
             SELECT setval(
                 pg_get_serial_sequence('media_items', 'media_id'),
-                COALESCE((SELECT MAX(media_id) FROM media_items), 0),
+                GREATEST(COALESCE((SELECT MAX(media_id) FROM media_items), 1), 1),
                 true
             )
             """
@@ -493,19 +493,19 @@ def migrate_sqlite_new_content_to_postgres() -> None:
             SELECT setval(
                 pg_get_serial_sequence('content', 'content_id'),
                 GREATEST(
-                    COALESCE((SELECT MAX(content_id) FROM content), 0),
+                    COALESCE((SELECT MAX(content_id) FROM content), 1),
                     %s
                 ),
                 true
             )
             """,
-            (POSTGRES_MIN_CONTENT_ID - 1,),
+            (max(POSTGRES_MIN_CONTENT_ID - 1, 1),),
         )
         p.execute(
             """
             SELECT setval(
                 pg_get_serial_sequence('media_items', 'media_id'),
-                COALESCE((SELECT MAX(media_id) FROM media_items), 0),
+                GREATEST(COALESCE((SELECT MAX(media_id) FROM media_items), 1), 1),
                 true
             )
             """
