@@ -29,6 +29,10 @@ import shutil
 from typing import Dict, Any, List, Optional
 
 import aiohttp
+try:
+    import psycopg2
+except Exception:
+    psycopg2 = None
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -61,6 +65,7 @@ _runtime_mode = "stopped"
 _telegram_app = None
 _telegram_loop = None
 _webhook_ready = Event()
+_pg_content_ready = False
 
 @app.route('/')
 def home():
@@ -115,12 +120,29 @@ def run():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", "8080")))
 
 # ---------- CONFIG (ENV-friendly) ----------
+def _default_db_path() -> str:
+    explicit = os.environ.get("DB_PATH", "").strip()
+    if explicit:
+        return explicit
+    for key in ("DB_DIRECTORY", "LEAPCELL_DATA_DIR", "LEAPCELL_VOLUME_DIR", "PERSISTENT_DATA_DIR"):
+        directory = os.environ.get(key, "").strip()
+        if directory:
+            return os.path.join(directory, "tgBotdb.db")
+    return "tgBotdb.db"
+
 UPLOAD_BOT_TOKEN = os.environ.get("UPLOAD_BOT_TOKEN", "8413595718:AAEI8yJAcDt22VbzASEpNR_aJNMXrMscdGk")
 MAIN_CHANNEL_ID = os.environ.get("MAIN_CHANNEL_ID", "-1003104322226")
 PASSWORD = os.environ.get("UPLOAD_PASSWORD", "test")
 PASSWORD_VALID_SECONDS = int(os.environ.get("PASSWORD_VALID_SECONDS", 24 * 3600))
-DB_PATH = os.environ.get("DB_PATH", "tgBotdb.db")
-DB_BACKUP_PATH = os.environ.get("DB_BACKUP_PATH", "").strip()
+DB_PATH = _default_db_path()
+DB_BACKUP_PATH = os.environ.get("DB_BACKUP_PATH", "tgBotdb.db").strip()
+POSTGRES_URI = os.environ.get("POSTGRES_URI", os.environ.get("DATABASE_URL", "postgresql://haakpdvgrlbmjjcusspz:bidvkgltggbislthadvwflbacjivns@9qasp5v56q8ckkf5dc.leapcellpool.com:6438/dngsaoimqiwngxsmugpg?sslmode=require")).strip()
+LEGACY_MAX_CONTENT_ID = int(os.environ.get("LEGACY_MAX_CONTENT_ID", "119"))
+POSTGRES_MIN_CONTENT_ID = int(os.environ.get("POSTGRES_MIN_CONTENT_ID", str(LEGACY_MAX_CONTENT_ID + 1)))
+STRICT_POSTGRES_CONTENT = os.environ.get(
+    "STRICT_POSTGRES_CONTENT",
+    "1" if POSTGRES_URI else "0",
+).strip().lower() in ("1", "true", "yes")
 ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "6233731222").split(",") if x.strip().isdigit()]
 OWNER_ID = ADMIN_IDS[0] if ADMIN_IDS else None
 
@@ -138,7 +160,8 @@ TELEGRAM_READ_TIMEOUT_SECONDS = float(os.environ.get("TELEGRAM_READ_TIMEOUT_SECO
 TELEGRAM_WRITE_TIMEOUT_SECONDS = float(os.environ.get("TELEGRAM_WRITE_TIMEOUT_SECONDS", "30"))
 TELEGRAM_POOL_TIMEOUT_SECONDS = float(os.environ.get("TELEGRAM_POOL_TIMEOUT_SECONDS", "15"))
 TELEGRAM_CONNECTION_POOL_SIZE = int(os.environ.get("TELEGRAM_CONNECTION_POOL_SIZE", "32"))
-ALLOW_TMP_DB_FALLBACK = os.environ.get("ALLOW_TMP_DB_FALLBACK", "0").strip().lower() in ("1", "true", "yes")
+# Keep runtime available on hosts where only /tmp is writable for local SQLite metadata.
+ALLOW_TMP_DB_FALLBACK = os.environ.get("ALLOW_TMP_DB_FALLBACK", "1").strip().lower() in ("1", "true", "yes")
 
 # default runtime flag; actual value loaded from DB settings at startup
 content_protection = True
@@ -329,6 +352,174 @@ def _ensure_writable_db_path() -> None:
         logger.warning("Using /tmp for database fallback. Data may be lost after restart: %s", fallback_path)
     logger.warning("DB path %s is read-only. Using writable fallback DB path: %s", DB_PATH, fallback_path)
     DB_PATH = fallback_path
+
+def _pg_connect():
+    if psycopg2 is None:
+        raise RuntimeError("psycopg2 is not installed")
+    return psycopg2.connect(POSTGRES_URI, connect_timeout=8)
+
+def init_postgres_content_db() -> None:
+    global _pg_content_ready
+    if not POSTGRES_URI:
+        _pg_content_ready = False
+        logger.warning("POSTGRES_URI is not set. Using SQLite for all content storage.")
+        return
+    if psycopg2 is None:
+        _pg_content_ready = False
+        logger.error("psycopg2 is not installed. Add it to requirements to use PostgreSQL.")
+        return
+    try:
+        conn = _pg_connect()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS content(
+                content_id BIGSERIAL PRIMARY KEY,
+                uploader_id BIGINT,
+                thumb_file_id TEXT,
+                description TEXT,
+                is_text_only INTEGER DEFAULT 0,
+                requires_token INTEGER DEFAULT 0,
+                created_at BIGINT,
+                main_channel_message_id BIGINT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS media_items(
+                media_id BIGSERIAL PRIMARY KEY,
+                content_id BIGINT,
+                file_id TEXT,
+                file_unique_id TEXT,
+                media_type TEXT,
+                is_forwarded INTEGER DEFAULT 0
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pg_media_items_content_id ON media_items(content_id)")
+        cur.execute(
+            """
+            SELECT setval(
+                pg_get_serial_sequence('content', 'content_id'),
+                GREATEST(
+                    COALESCE((SELECT MAX(content_id) FROM content), 0),
+                    %s
+                ),
+                true
+            )
+            """,
+            (POSTGRES_MIN_CONTENT_ID - 1,),
+        )
+        cur.execute(
+            """
+            SELECT setval(
+                pg_get_serial_sequence('media_items', 'media_id'),
+                COALESCE((SELECT MAX(media_id) FROM media_items), 0),
+                true
+            )
+            """
+        )
+        conn.commit()
+        cur.execute("SELECT COUNT(1) FROM content")
+        row = cur.fetchone()
+        rows = int(row[0] if row and row[0] is not None else 0)
+        cur.close()
+        conn.close()
+        _pg_content_ready = True
+        logger.info(
+            "PostgreSQL content storage ready (rows=%s, new posts start at id >= %s).",
+            rows,
+            POSTGRES_MIN_CONTENT_ID,
+        )
+    except Exception:
+        _pg_content_ready = False
+        logger.exception("Failed to initialize PostgreSQL content DB. Falling back to SQLite content storage.")
+
+def migrate_sqlite_new_content_to_postgres() -> None:
+    """
+    One-way backup/migration:
+    copy SQLite content/media rows with id >= POSTGRES_MIN_CONTENT_ID into PostgreSQL.
+    """
+    if not _pg_content_ready:
+        return
+    try:
+        sq = sqlite3.connect(DB_PATH)
+        s = sq.cursor()
+        s.execute(
+            """
+            SELECT content_id, uploader_id, thumb_file_id, description, is_text_only, requires_token, created_at, main_channel_message_id
+            FROM content
+            WHERE content_id >= ?
+            ORDER BY content_id ASC
+            """,
+            (POSTGRES_MIN_CONTENT_ID,),
+        )
+        content_rows = s.fetchall()
+        if not content_rows:
+            sq.close()
+            return
+        ids = [int(row[0]) for row in content_rows]
+        placeholders = ",".join("?" for _ in ids)
+        s.execute(
+            f"SELECT media_id, content_id, file_id, file_unique_id, media_type, is_forwarded FROM media_items WHERE content_id IN ({placeholders})",
+            ids,
+        )
+        media_rows = s.fetchall()
+        sq.close()
+
+        pg = _pg_connect()
+        p = pg.cursor()
+        for row in content_rows:
+            p.execute(
+                """
+                INSERT INTO content(content_id, uploader_id, thumb_file_id, description, is_text_only, requires_token, created_at, main_channel_message_id)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (content_id) DO NOTHING
+                """,
+                row,
+            )
+        for row in media_rows:
+            p.execute(
+                """
+                INSERT INTO media_items(media_id, content_id, file_id, file_unique_id, media_type, is_forwarded)
+                VALUES(%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (media_id) DO NOTHING
+                """,
+                row,
+            )
+        p.execute(
+            """
+            SELECT setval(
+                pg_get_serial_sequence('content', 'content_id'),
+                GREATEST(
+                    COALESCE((SELECT MAX(content_id) FROM content), 0),
+                    %s
+                ),
+                true
+            )
+            """,
+            (POSTGRES_MIN_CONTENT_ID - 1,),
+        )
+        p.execute(
+            """
+            SELECT setval(
+                pg_get_serial_sequence('media_items', 'media_id'),
+                COALESCE((SELECT MAX(media_id) FROM media_items), 0),
+                true
+            )
+            """
+        )
+        pg.commit()
+        p.close()
+        pg.close()
+        logger.info(
+            "SQLite -> PostgreSQL backup sync complete (content rows synced=%s, media rows synced=%s).",
+            len(content_rows),
+            len(media_rows),
+        )
+    except Exception:
+        logger.exception("Failed to sync SQLite content backup to PostgreSQL.")
 
 def _apply_db_schema(conn: sqlite3.Connection) -> None:
     c = conn.cursor()
@@ -679,42 +870,191 @@ def get_saved_thumbnail(thumb_id: int) -> Optional[Dict[str, Any]]:
     return {"thumb_id": row[0], "owner_id": row[1], "thumb_file_id": row[2], "name": row[3]}
 
 def save_content_to_db(uploader_id: int, thumb_file_id: str, description: str, is_text_only: int, requires_token: int) -> int:
+    now = int(time.time())
+    if POSTGRES_URI:
+        if not _pg_content_ready:
+            raise RuntimeError("PostgreSQL content DB is not ready.")
+        try:
+            conn = _pg_connect()
+            c = conn.cursor()
+            c.execute(
+                """
+                INSERT INTO content(uploader_id, thumb_file_id, description, is_text_only, requires_token, created_at)
+                VALUES(%s,%s,%s,%s,%s,%s)
+                RETURNING content_id
+                """,
+                (uploader_id, thumb_file_id, description, is_text_only, requires_token, now),
+            )
+            row = c.fetchone()
+            conn.commit()
+            c.close()
+            conn.close()
+            content_id = int(row[0])
+            return content_id
+        except Exception:
+            logger.exception("Failed to save content in PostgreSQL.")
+            if STRICT_POSTGRES_CONTENT:
+                raise
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    now = int(time.time())
-    c.execute("""INSERT INTO content(uploader_id, thumb_file_id, description, is_text_only, requires_token, created_at)
-                 VALUES(?,?,?,?,?,?)""", (uploader_id, thumb_file_id, description, is_text_only, requires_token, now))
+    c.execute(
+        """INSERT INTO content(uploader_id, thumb_file_id, description, is_text_only, requires_token, created_at)
+           VALUES(?,?,?,?,?,?)""",
+        (uploader_id, thumb_file_id, description, is_text_only, requires_token, now),
+    )
     content_id = c.lastrowid
     conn.commit()
     conn.close()
-    return content_id
+    return int(content_id)
 
 def add_media_item(content_id: int, file_id: str, file_unique_id: str, media_type: str, is_forwarded: int = 0):
+    if POSTGRES_URI and content_id >= POSTGRES_MIN_CONTENT_ID:
+        if not _pg_content_ready:
+            raise RuntimeError("PostgreSQL content DB is not ready.")
+        try:
+            conn = _pg_connect()
+            c = conn.cursor()
+            c.execute(
+                """
+                INSERT INTO media_items(content_id, file_id, file_unique_id, media_type, is_forwarded)
+                VALUES(%s,%s,%s,%s,%s)
+                """,
+                (content_id, file_id, file_unique_id, media_type, is_forwarded),
+            )
+            conn.commit()
+            c.close()
+            conn.close()
+            return
+        except Exception:
+            logger.exception("Failed to save media in PostgreSQL for content_id=%s.", content_id)
+            if STRICT_POSTGRES_CONTENT:
+                raise
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""INSERT INTO media_items(content_id, file_id, file_unique_id, media_type, is_forwarded)
-                 VALUES(?,?,?,?,?)""", (content_id, file_id, file_unique_id, media_type, is_forwarded))
+    c.execute(
+        """INSERT INTO media_items(content_id, file_id, file_unique_id, media_type, is_forwarded)
+           VALUES(?,?,?,?,?)""",
+        (content_id, file_id, file_unique_id, media_type, is_forwarded),
+    )
     conn.commit()
     conn.close()
 
-def get_content(content_id: int) -> Optional[Dict[str, Any]]:
+def _get_content_sqlite(content_id: int) -> Optional[Dict[str, Any]]:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT content_id, uploader_id, thumb_file_id, description, is_text_only, requires_token, created_at, main_channel_message_id FROM content WHERE content_id = ?", (content_id,))
+    c.execute(
+        "SELECT content_id, uploader_id, thumb_file_id, description, is_text_only, requires_token, created_at, main_channel_message_id FROM content WHERE content_id = ?",
+        (content_id,),
+    )
     row = c.fetchone()
     if not row:
         conn.close()
         return None
     keys = ["content_id", "uploader_id", "thumb_file_id", "description", "is_text_only", "requires_token", "created_at", "main_channel_message_id"]
     content = dict(zip(keys, row))
-    # fetch media items
-    c.execute("SELECT media_id, file_id, file_unique_id, media_type, is_forwarded FROM media_items WHERE content_id = ? ORDER BY media_id ASC", (content_id,))
+    c.execute(
+        "SELECT media_id, file_id, file_unique_id, media_type, is_forwarded FROM media_items WHERE content_id = ? ORDER BY media_id ASC",
+        (content_id,),
+    )
     media_rows = c.fetchall()
     content["media_items"] = [
         {"media_id": r[0], "file_id": r[1], "file_unique_id": r[2], "media_type": r[3], "is_forwarded": r[4]} for r in media_rows
     ]
     conn.close()
     return content
+
+def _get_content_postgres(content_id: int) -> Optional[Dict[str, Any]]:
+    if not _pg_content_ready:
+        return None
+    try:
+        conn = _pg_connect()
+        c = conn.cursor()
+        c.execute(
+            "SELECT content_id, uploader_id, thumb_file_id, description, is_text_only, requires_token, created_at, main_channel_message_id FROM content WHERE content_id = %s",
+            (content_id,),
+        )
+        row = c.fetchone()
+        if not row:
+            c.close()
+            conn.close()
+            return None
+        keys = ["content_id", "uploader_id", "thumb_file_id", "description", "is_text_only", "requires_token", "created_at", "main_channel_message_id"]
+        content = dict(zip(keys, row))
+        c.execute(
+            "SELECT media_id, file_id, file_unique_id, media_type, is_forwarded FROM media_items WHERE content_id = %s ORDER BY media_id ASC",
+            (content_id,),
+        )
+        media_rows = c.fetchall()
+        content["media_items"] = [
+            {"media_id": r[0], "file_id": r[1], "file_unique_id": r[2], "media_type": r[3], "is_forwarded": r[4]} for r in media_rows
+        ]
+        c.close()
+        conn.close()
+        return content
+    except Exception:
+        logger.exception("Failed reading content_id=%s from PostgreSQL.", content_id)
+        return None
+
+def get_content(content_id: int) -> Optional[Dict[str, Any]]:
+    if POSTGRES_URI and content_id >= POSTGRES_MIN_CONTENT_ID:
+        content = _get_content_postgres(content_id)
+        if content:
+            return content
+        if STRICT_POSTGRES_CONTENT:
+            return None
+        return _get_content_sqlite(content_id)
+    content = _get_content_sqlite(content_id)
+    if content:
+        return content
+    return _get_content_postgres(content_id)
+
+def update_content_description(content_id: int, description: str) -> None:
+    if POSTGRES_URI and content_id >= POSTGRES_MIN_CONTENT_ID:
+        if not _pg_content_ready:
+            raise RuntimeError("PostgreSQL content DB is not ready.")
+        try:
+            conn = _pg_connect()
+            c = conn.cursor()
+            c.execute("UPDATE content SET description = %s WHERE content_id = %s", (description, content_id))
+            conn.commit()
+            affected = c.rowcount
+            c.close()
+            conn.close()
+            if affected > 0:
+                return
+        except Exception:
+            logger.exception("Failed to update description in PostgreSQL for content_id=%s.", content_id)
+            if STRICT_POSTGRES_CONTENT:
+                raise
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE content SET description = ? WHERE content_id = ?", (description, content_id))
+    conn.commit()
+    conn.close()
+
+def update_main_channel_message_id(content_id: int, message_id: int) -> None:
+    if POSTGRES_URI and content_id >= POSTGRES_MIN_CONTENT_ID:
+        if not _pg_content_ready:
+            raise RuntimeError("PostgreSQL content DB is not ready.")
+        try:
+            conn = _pg_connect()
+            c = conn.cursor()
+            c.execute("UPDATE content SET main_channel_message_id = %s WHERE content_id = %s", (message_id, content_id))
+            conn.commit()
+            affected = c.rowcount
+            c.close()
+            conn.close()
+            if affected > 0:
+                return
+        except Exception:
+            logger.exception("Failed to update main_channel_message_id in PostgreSQL for content_id=%s.", content_id)
+            if STRICT_POSTGRES_CONTENT:
+                raise
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE content SET main_channel_message_id = ? WHERE content_id = ?", (message_id, content_id))
+    conn.commit()
+    conn.close()
 
 # ----------------- Token helpers -----------------
 def token_exists_in_tokens(token: str) -> bool:
@@ -1255,11 +1595,7 @@ async def token_choice_callback(update: Update, context: ContextTypes.DEFAULT_TY
         url_text = session.get("url_text", "")
         if url_text:
             description_to_save = f"{description}\n\n[URL/TEXT]\n{url_text}"
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            c.execute("UPDATE content SET description = ? WHERE content_id = ?", (description_to_save, content_id))
-            conn.commit()
-            conn.close()
+            update_content_description(content_id, description_to_save)
 
     counts = count_media_for_session(session)
     summary = f"🖼 Photos: {counts['photos']} | 🎬 Videos: {counts['videos']}"
@@ -1271,11 +1607,7 @@ async def token_choice_callback(update: Update, context: ContextTypes.DEFAULT_TY
     caption = f"{session.get('description','')}\n\n{summary}\n\n{'🔒 Token: Required' if requires_token else '🟢 Free'}"
     try:
         sent = await context.bot.send_photo(chat_id=MAIN_CHANNEL_ID, photo=thumbnail, caption=caption, reply_markup=kb)
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("UPDATE content SET main_channel_message_id = ? WHERE content_id = ?", (sent.message_id, content_id))
-        conn.commit()
-        conn.close()
+        update_main_channel_message_id(content_id, sent.message_id)
     except Exception as e:
         logger.exception("Failed to post to main channel: %s", e)
         await query.edit_message_text(f"Saved content (id {content_id}) but failed to post to MAIN CHANNEL. Error: {e}")
@@ -1768,6 +2100,17 @@ def run_telegram_bot():
     _webhook_ready.clear()
     try:
         init_db()
+        init_postgres_content_db()
+        if POSTGRES_URI and STRICT_POSTGRES_CONTENT and not _pg_content_ready:
+            raise RuntimeError("STRICT_POSTGRES_CONTENT=1 but PostgreSQL content DB initialization failed.")
+        migrate_sqlite_new_content_to_postgres()
+        logger.info(
+            "Content storage routing: legacy ids <= %s -> SQLite, new ids >= %s -> %s (strict=%s)",
+            LEGACY_MAX_CONTENT_ID,
+            POSTGRES_MIN_CONTENT_ID,
+            "PostgreSQL" if _pg_content_ready else "SQLite",
+            STRICT_POSTGRES_CONTENT,
+        )
         load_password_from_db()
         load_protection_from_db()
         _telegram_app = build_telegram_application()
